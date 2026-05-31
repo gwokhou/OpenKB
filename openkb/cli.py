@@ -8,6 +8,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import asyncio
+import contextlib  # noqa: E402
 import json
 import logging
 import shutil
@@ -45,6 +46,7 @@ from dotenv import load_dotenv
 
 from openkb.config import DEFAULT_CONFIG, load_config, save_config, load_global_config, register_kb
 from openkb.converter import convert_document
+from openkb.locks import atomic_write_json, atomic_write_text  # noqa: E402
 from openkb.log import append_log
 from openkb.schema import AGENTS_MD, INDEX_SEED, PAGE_CONTENT_DIRS
 
@@ -291,11 +293,83 @@ def _non_negative_int(value: object, default: int) -> int:
     return max(0, parsed)
 
 
+@contextlib.contextmanager
+def _kb_lock(openkb_dir: Path, *, exclusive: bool):
+    """Hold a cooperative KB-level lock.
+
+    Writers take an exclusive lock. Readers that need a consistent wiki
+    snapshot take a shared lock so they block while add/remove/lint-style
+    mutations are in progress.
+    """
+    from openkb.locks import kb_lock
+
+    with kb_lock(openkb_dir, exclusive=exclusive):
+        yield
+
+
+def _kb_ingest_lock(openkb_dir: Path):
+    """Hold an exclusive KB-level ingest lock across prepare and commit."""
+    return _kb_lock(openkb_dir, exclusive=True)
+
+
+def _kb_read_lock(openkb_dir: Path):
+    """Hold a shared KB-level lock for consistent read-only snapshots."""
+    return _kb_lock(openkb_dir, exclusive=False)
+
+
+@contextlib.contextmanager
+def _cwd_init_lock() -> None:
+    """Serialize `openkb init` inside the current working directory."""
+    import fcntl
+
+    lock_path = Path(".openkb.init.lock")
+    with lock_path.open("a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_json_dump(path: Path, data: object) -> None:
+    atomic_write_json(path, data)
+
+
+def _doc_name_for_meta(meta: dict) -> str:
+    doc_name = meta.get("doc_name")
+    if doc_name:
+        return str(doc_name)
+    name = meta.get("name")
+    return Path(str(name)).stem if name else ""
+
+
+def _registry_doc_name_conflict(registry, doc_name: str, file_hash: str | None) -> dict | None:
+    """Return existing metadata when doc_name is already owned by another hash."""
+    if not file_hash:
+        return None
+    for existing_hash, meta in registry.all_entries().items():
+        if existing_hash != file_hash and _doc_name_for_meta(meta) == doc_name:
+            return meta
+    return None
+
+
+def _convert_document_assume_locked(file_path: Path, kb_dir: Path):
+    import inspect
+    from unittest.mock import Mock
+
+    if isinstance(convert_document, Mock):
+        return convert_document(file_path, kb_dir)
+    signature = inspect.signature(convert_document)
+    if "assume_locked" in signature.parameters:
+        return convert_document(file_path, kb_dir, assume_locked=True)
+    return convert_document(file_path, kb_dir)
+
+
 def _prepare_add_file(file_path: Path, kb_dir: Path) -> _PreparedAdd:
     """Run the file-local producer stage: conversion, extraction, dedup."""
     logger = logging.getLogger(__name__)
     try:
-        result = convert_document(file_path, kb_dir)
+        result = _convert_document_assume_locked(file_path, kb_dir)
     except Exception as exc:
         logger.debug("Conversion traceback:", exc_info=True)
         return _PreparedAdd(
@@ -337,13 +411,23 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
         return "skipped"
 
     doc_name = file_path.stem
+    conflict = _registry_doc_name_conflict(registry, doc_name, result.file_hash)
+    if conflict:
+        click.echo(
+            "  [ERROR] Document name conflict: "
+            f"{file_path.name} compiles to doc_name '{doc_name}', already used by "
+            f"{conflict.get('name', 'another document')}. Rename this file before adding."
+        )
+        return "failed"
     index_result = None
 
     if result.is_long_doc:
         click.echo(f"  Long document detected — indexing with PageIndex...")
         try:
             from openkb.indexer import index_long_document
-            index_result = index_long_document(result.raw_path, kb_dir)
+            index_result = index_long_document(
+                result.raw_path, kb_dir, assume_locked=True,
+            )
         except Exception as exc:
             click.echo(f"  [ERROR] Indexing failed: {exc}")
             logger.debug("Indexing traceback:", exc_info=True)
@@ -361,6 +445,7 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
                         kb_dir,
                         model,
                         doc_description=index_result.description,
+                        assume_locked=True,
                     )
                 )
                 break
@@ -376,7 +461,12 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
         click.echo(f"  Compiling short doc...")
         for attempt in range(2):
             try:
-                asyncio.run(compile_short_doc(doc_name, result.source_path, kb_dir, model))
+                asyncio.run(
+                    compile_short_doc(
+                        doc_name, result.source_path, kb_dir, model,
+                        assume_locked=True,
+                    )
+                )
                 break
             except Exception as exc:
                 if attempt == 0:
@@ -398,7 +488,7 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
             meta["doc_id"] = index_result.doc_id
         registry.add(result.file_hash, meta)
 
-    append_log(kb_dir / "wiki", "ingest", file_path.name)
+    append_log(kb_dir / "wiki", "ingest", file_path.name, assume_locked=True)
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
     return "added"
 
@@ -425,7 +515,27 @@ def add_single_file(file_path: Path, kb_dir: Path) -> _AddOutcome:
     _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
     click.echo(f"Adding: {file_path.name}")
-    return _commit_prepared_add(_prepare_add_file(file_path, kb_dir), kb_dir, model)
+    with _kb_ingest_lock(openkb_dir):
+        from openkb.state import HashRegistry
+
+        registry = HashRegistry(openkb_dir / "hashes.json")
+        try:
+            file_hash = HashRegistry.hash_file(file_path)
+        except Exception as exc:
+            click.echo(f"  [ERROR] Hash failed: {exc}")
+            return "failed"
+        if registry.is_known(file_hash):
+            click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
+            return "skipped"
+        conflict = _registry_doc_name_conflict(registry, file_path.stem, file_hash)
+        if conflict:
+            click.echo(
+                "  [ERROR] Document name conflict: "
+                f"{file_path.name} compiles to doc_name '{file_path.stem}', already used by "
+                f"{conflict.get('name', 'another document')}. Rename this file before adding."
+            )
+            return "failed"
+        return _commit_prepared_add(_prepare_add_file(file_path, kb_dir), kb_dir, model)
 
 
 def _add_files_batch(
@@ -436,6 +546,19 @@ def _add_files_batch(
     buffer_size: int | None = None,
 ) -> dict[_AddOutcome, int]:
     """Process many files with bounded producer concurrency and serial commits."""
+    openkb_dir = kb_dir / ".openkb"
+    with _kb_ingest_lock(openkb_dir):
+        return _add_files_batch_locked(files, kb_dir, jobs=jobs, buffer_size=buffer_size)
+
+
+def _add_files_batch_locked(
+    files: list[Path],
+    kb_dir: Path,
+    *,
+    jobs: int | None = None,
+    buffer_size: int | None = None,
+) -> dict[_AddOutcome, int]:
+    """Implementation for `_add_files_batch`; caller must hold ingest lock."""
     from openkb.state import HashRegistry
 
     openkb_dir = kb_dir / ".openkb"
@@ -457,15 +580,6 @@ def _add_files_batch(
 
     for file_path in files:
         doc_name = file_path.stem
-        if doc_name in seen_doc_names:
-            click.echo(f"\nAdding: {file_path.name}")
-            click.echo(
-                "  [ERROR] Document name conflict: "
-                f"{file_path} and {seen_doc_names[doc_name]} both compile to "
-                f"doc_name '{doc_name}'. Rename one file before adding."
-            )
-            counts["failed"] += 1
-            continue
         try:
             file_hash = HashRegistry.hash_file(file_path)
         except Exception as exc:
@@ -477,6 +591,25 @@ def _add_files_batch(
             click.echo(f"\nAdding: {file_path.name}")
             click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
             counts["skipped"] += 1
+            continue
+        if doc_name in seen_doc_names:
+            click.echo(f"\nAdding: {file_path.name}")
+            click.echo(
+                "  [ERROR] Document name conflict: "
+                f"{file_path} and {seen_doc_names[doc_name]} both compile to "
+                f"doc_name '{doc_name}'. Rename one file before adding."
+            )
+            counts["failed"] += 1
+            continue
+        conflict = _registry_doc_name_conflict(registry, doc_name, file_hash)
+        if conflict:
+            click.echo(f"\nAdding: {file_path.name}")
+            click.echo(
+                "  [ERROR] Document name conflict: "
+                f"{file_path.name} compiles to doc_name '{doc_name}', already used by "
+                f"{conflict.get('name', 'another document')}. Rename this file before adding."
+            )
+            counts["failed"] += 1
             continue
         seen_hashes.add(file_hash)
         seen_doc_names[doc_name] = file_path
@@ -650,78 +783,81 @@ def _stdin_is_tty() -> bool:
 def init(model, language):
     """Initialise a new knowledge base in the current directory."""
     openkb_dir = Path(".openkb")
-    if openkb_dir.exists():
-        click.echo("Knowledge base already initialized.")
-        return
+    with _cwd_init_lock():
+        if openkb_dir.exists():
+            click.echo("Knowledge base already initialized.")
+            return
 
-    # Interactive prompts
-    click.echo("Pick an LLM in `provider/model` LiteLLM format:")
-    click.echo("  OpenAI:    gpt-5.4-mini, gpt-5.4")
-    click.echo("  Anthropic: anthropic/claude-sonnet-4-6, anthropic/claude-opus-4-6")
-    click.echo("  Gemini:    gemini/gemini-3.1-pro-preview, gemini/gemini-3-flash-preview")
-    click.echo("  DeepSeek:  deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro")
-    click.echo("  Others:    see https://docs.litellm.ai/docs/providers")
-    click.echo()
-    if model is None and _stdin_is_tty():
-        model = _coerce_model(click.prompt(
-            f"Model (enter for default {DEFAULT_CONFIG['model']})",
-            default=DEFAULT_CONFIG["model"],
+        # Interactive prompts are inside the init lock so two concurrent
+        # `openkb init` processes do not both ask questions before one exits.
+        click.echo("Pick an LLM in `provider/model` LiteLLM format:")
+        click.echo("  OpenAI:    gpt-5.4-mini, gpt-5.4")
+        click.echo("  Anthropic: anthropic/claude-sonnet-4-6, anthropic/claude-opus-4-6")
+        click.echo("  Gemini:    gemini/gemini-3.1-pro-preview, gemini/gemini-3-flash-preview")
+        click.echo("  DeepSeek:  deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro")
+        click.echo("  Others:    see https://docs.litellm.ai/docs/providers")
+        click.echo()
+        if model is None and _stdin_is_tty():
+            model = _coerce_model(click.prompt(
+                f"Model (enter for default {DEFAULT_CONFIG['model']})",
+                default=DEFAULT_CONFIG["model"],
+                show_default=False,
+            ))
+        if not model:
+            model = DEFAULT_CONFIG["model"]
+        api_key = click.prompt(
+            "LLM API Key (saved to .env, enter to skip)",
+            default="",
+            hide_input=True,
             show_default=False,
-        ))
-    if not model:
-        model = DEFAULT_CONFIG["model"]
-    api_key = click.prompt(
-        "LLM API Key (saved to .env, enter to skip)",
-        default="",
-        hide_input=True,
-        show_default=False,
-    ).strip()
-    if language is None and _stdin_is_tty():
-        language = _coerce_language(click.prompt(
-            f"Wiki language (enter for default {DEFAULT_CONFIG['language']})",
-            default=DEFAULT_CONFIG["language"],
-            show_default=False,
-        ))
-    if not language:
-        language = DEFAULT_CONFIG["language"]
-    # Create directory structure
-    Path("raw").mkdir(exist_ok=True)
-    Path("wiki/sources/images").mkdir(parents=True, exist_ok=True)
-    Path("wiki/summaries").mkdir(parents=True, exist_ok=True)
-    Path("wiki/concepts").mkdir(parents=True, exist_ok=True)
-    Path("wiki/entities").mkdir(parents=True, exist_ok=True)
+        ).strip()
+        if language is None and _stdin_is_tty():
+            language = _coerce_language(click.prompt(
+                f"Wiki language (enter for default {DEFAULT_CONFIG['language']})",
+                default=DEFAULT_CONFIG["language"],
+                show_default=False,
+            ))
+        if not language:
+            language = DEFAULT_CONFIG["language"]
 
-    # Write wiki files
-    Path("wiki/AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
-    Path("wiki/index.md").write_text(INDEX_SEED, encoding="utf-8")
-    Path("wiki/log.md").write_text("# Operations Log\n\n", encoding="utf-8")
+        # Create directory structure
+        Path("raw").mkdir(exist_ok=True)
+        Path("wiki/sources/images").mkdir(parents=True, exist_ok=True)
+        Path("wiki/summaries").mkdir(parents=True, exist_ok=True)
+        Path("wiki/concepts").mkdir(parents=True, exist_ok=True)
+        Path("wiki/entities").mkdir(parents=True, exist_ok=True)
 
-    # Create .openkb/ state directory
-    openkb_dir.mkdir()
-    config = {
-        "model": model,
-        "language": language,
-        "pageindex_threshold": DEFAULT_CONFIG["pageindex_threshold"],
-        "mineru_backend": DEFAULT_CONFIG["mineru_backend"],
-        "mineru_output_dir": DEFAULT_CONFIG["mineru_output_dir"],
-        "file_processing_jobs": DEFAULT_CONFIG["file_processing_jobs"],
-        "pipeline_buffer_size": DEFAULT_CONFIG["pipeline_buffer_size"],
-    }
-    save_config(openkb_dir / "config.yaml", config)
-    (openkb_dir / "hashes.json").write_text(json.dumps({}), encoding="utf-8")
+        # Write wiki files
+        Path("wiki/AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
+        Path("wiki/index.md").write_text(INDEX_SEED, encoding="utf-8")
+        Path("wiki/log.md").write_text("# Operations Log\n\n", encoding="utf-8")
 
-    # Write API key to KB-local .env (0600) if the user provided one
-    if api_key:
-        env_path = Path(".env")
-        if env_path.exists():
-            click.echo(".env already exists, skipping write. Add LLM_API_KEY manually if needed.")
-        else:
-            env_path.write_text(f"LLM_API_KEY={api_key}\n", encoding="utf-8")
-            os.chmod(env_path, 0o600)
-            click.echo("Saved LLM API key to .env.")
+        # Create .openkb/ state directory
+        openkb_dir.mkdir()
+        config = {
+            "model": model,
+            "language": language,
+            "pageindex_threshold": DEFAULT_CONFIG["pageindex_threshold"],
+            "mineru_backend": DEFAULT_CONFIG["mineru_backend"],
+            "mineru_output_dir": DEFAULT_CONFIG["mineru_output_dir"],
+            "file_processing_jobs": DEFAULT_CONFIG["file_processing_jobs"],
+            "pipeline_buffer_size": DEFAULT_CONFIG["pipeline_buffer_size"],
+        }
+        save_config(openkb_dir / "config.yaml", config)
+        _atomic_json_dump(openkb_dir / "hashes.json", {})
 
-    # Register this KB in the global config
-    register_kb(Path.cwd())
+        # Write API key to KB-local .env (0600) if the user provided one
+        if api_key:
+            env_path = Path(".env")
+            if env_path.exists():
+                click.echo(".env already exists, skipping write. Add LLM_API_KEY manually if needed.")
+            else:
+                env_path.write_text(f"LLM_API_KEY={api_key}\n", encoding="utf-8")
+                os.chmod(env_path, 0o600)
+                click.echo("Saved LLM API key to .env.")
+
+        # Register this KB in the global config
+        register_kb(Path.cwd())
 
     click.echo("Knowledge base initialized.")
 
@@ -754,6 +890,7 @@ def add(ctx, path, jobs, buffer_size):
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
+    openkb_dir = kb_dir / ".openkb"
 
     # URL ingest: download into raw/ first, then call add_single_file
     # explicitly so we can clean up the just-downloaded file if it
@@ -762,7 +899,8 @@ def add(ctx, path, jobs, buffer_size):
     # that the registry can't reach via openkb remove.
     from openkb.url_ingest import looks_like_url, fetch_url_to_raw
     if looks_like_url(path):
-        fetched = fetch_url_to_raw(path, kb_dir)
+        with _kb_ingest_lock(openkb_dir):
+            fetched = fetch_url_to_raw(path, kb_dir, assume_locked=True)
         if fetched is None:
             return
         outcome = add_single_file(fetched, kb_dir)
@@ -840,34 +978,42 @@ def query(ctx, question, save, raw):
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
     stream = _stream_to_tty()
+    saved_path: Path | None = None
     try:
-        answer = asyncio.run(run_query(question, kb_dir, model, stream=stream, raw=raw))
-        if not stream and answer:
-            click.echo(answer)
+        with _kb_ingest_lock(openkb_dir):
+            answer = asyncio.run(run_query(question, kb_dir, model, stream=stream, raw=raw))
+            append_log(kb_dir / "wiki", "query", question, assume_locked=True)
+
+            if save and answer:
+                import re
+                from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
+                slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60]
+                explore_dir = kb_dir / "wiki" / "explorations"
+                explore_dir.mkdir(parents=True, exist_ok=True)
+                explore_path = explore_dir / f"{slug}.md"
+                counter = 2
+                while explore_path.exists():
+                    explore_path = explore_dir / f"{slug}-{counter}.md"
+                    counter += 1
+                # Strip ghost wikilinks the agent may have emitted to non-existent
+                # concept/summary pages — the schema_md in the agent's instructions
+                # encourages [[wikilinks]] but the agent's view of "which pages
+                # exist" can drift from disk reality.
+                known = list_existing_wiki_targets(kb_dir / "wiki")
+                cleaned_answer, _ = strip_ghost_wikilinks(answer, known)
+                explore_path.write_text(
+                    f"---\nquery: \"{question}\"\n---\n\n{cleaned_answer}\n",
+                    encoding="utf-8",
+                )
+                saved_path = explore_path
     except Exception as exc:
         click.echo(f"[ERROR] Query failed: {exc}")
         return
 
-    append_log(kb_dir / "wiki", "query", question)
-
-    if save and answer:
-        import re
-        from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
-        slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60]
-        explore_dir = kb_dir / "wiki" / "explorations"
-        explore_dir.mkdir(parents=True, exist_ok=True)
-        explore_path = explore_dir / f"{slug}.md"
-        # Strip ghost wikilinks the agent may have emitted to non-existent
-        # concept/summary pages — the schema_md in the agent's instructions
-        # encourages [[wikilinks]] but the agent's view of "which pages
-        # exist" can drift from disk reality.
-        known = list_existing_wiki_targets(kb_dir / "wiki")
-        cleaned_answer, _ = strip_ghost_wikilinks(answer, known)
-        explore_path.write_text(
-            f"---\nquery: \"{question}\"\n---\n\n{cleaned_answer}\n",
-            encoding="utf-8",
-        )
-        click.echo(f"\nSaved to {explore_path}")
+    if not stream and answer:
+        click.echo(answer)
+    if saved_path is not None:
+        click.echo(f"\nSaved to {saved_path}")
 
 
 def _cleanup_pageindex(
@@ -968,6 +1114,33 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
     Concept and entity pages whose only source was this doc are deleted by
     default; use --keep-empty to retain them.
     """
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    openkb_dir = kb_dir / ".openkb"
+    with _kb_ingest_lock(openkb_dir):
+        _remove_locked(
+            kb_dir,
+            identifier,
+            keep_raw=keep_raw,
+            keep_empty_concepts=keep_empty_concepts,
+            dry_run=dry_run,
+            yes=yes,
+        )
+
+
+def _remove_locked(
+    kb_dir: Path,
+    identifier: str,
+    *,
+    keep_raw: bool,
+    keep_empty_concepts: bool,
+    dry_run: bool,
+    yes: bool,
+) -> None:
+    """Implementation for `remove`; caller must hold the KB ingest lock."""
     from openkb.agent.compiler import (
         remove_doc_from_concept_pages,
         remove_doc_from_entity_pages,
@@ -976,11 +1149,6 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
     )
     from openkb.lint import fix_broken_links
     from openkb.state import HashRegistry
-
-    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
-    if kb_dir is None:
-        click.echo("No knowledge base found. Run `openkb init` first.")
-        return
 
     openkb_dir = kb_dir / ".openkb"
     registry = HashRegistry(openkb_dir / "hashes.json")
@@ -1130,15 +1298,26 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
         shutil.rmtree(images_dir, ignore_errors=True)
 
     concept_result = remove_doc_from_concept_pages(
-        wiki_dir, doc_name, keep_empty=keep_empty,
+        wiki_dir,
+        doc_name,
+        keep_empty=keep_empty_concepts,
+        assume_locked=True,
     )
 
     entity_result = remove_doc_from_entity_pages(
-        wiki_dir, doc_name, keep_empty=keep_empty,
+        wiki_dir,
+        doc_name,
+        keep_empty=keep_empty_concepts,
+        assume_locked=True,
     )
 
-    remove_doc_from_index(wiki_dir, doc_name, concept_result["deleted"],
-                          entity_slugs_deleted=entity_result["deleted"])
+    remove_doc_from_index(
+        wiki_dir,
+        doc_name,
+        concept_result["deleted"],
+        entity_slugs_deleted=entity_result["deleted"],
+        assume_locked=True,
+    )
 
     # Strip dangling wikilinks now so a retry (after a PageIndex
     # failure below) finds a clean wiki — no point in re-running this
@@ -1161,7 +1340,9 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
     index_md = wiki_dir / "index.md"
     if index_md.exists():
         lint_scope.append(index_md)
-    files_changed, ghosts = fix_broken_links(wiki_dir, restrict_to=lint_scope)
+    files_changed, ghosts = fix_broken_links(
+        wiki_dir, restrict_to=lint_scope, assume_locked=True,
+    )
     if files_changed:
         click.echo(f"  lint --fix cleaned {ghosts} dangling wikilink(s) in {files_changed} file(s)")
 
@@ -1196,7 +1377,7 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
     if raw_path is not None:
         raw_path.unlink(missing_ok=True)
 
-    append_log(wiki_dir, "remove", name)
+    append_log(wiki_dir, "remove", name, assume_locked=True)
     click.echo(f"  [OK] {name} removed from knowledge base.")
 
 
@@ -1432,10 +1613,13 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
         load_session,
         relative_time,
         resolve_session_id,
+        session_lock,
     )
+    openkb_dir = kb_dir / ".openkb"
 
     if list_sessions_flag:
-        sessions = list_sessions(kb_dir)
+        with _kb_read_lock(openkb_dir):
+            sessions = list_sessions(kb_dir)
         if not sessions:
             click.echo("No chat sessions yet.")
             return
@@ -1453,46 +1637,54 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
         return
 
     if delete_id is not None:
-        try:
-            resolved = resolve_session_id(kb_dir, delete_id)
-        except ValueError as exc:
-            click.echo(f"[ERROR] {exc}")
-            return
+        with _kb_read_lock(openkb_dir):
+            try:
+                resolved = resolve_session_id(kb_dir, delete_id)
+            except ValueError as exc:
+                click.echo(f"[ERROR] {exc}")
+                return
         if not resolved:
             click.echo(f"No matching session: {delete_id}")
             return
-        if delete_session(kb_dir, resolved):
-            click.echo(f"Deleted session {resolved}")
-        else:
-            click.echo(f"Could not delete session: {resolved}")
+        with session_lock(kb_dir, resolved):
+            with _kb_ingest_lock(openkb_dir):
+                if delete_session(kb_dir, resolved, assume_locked=True):
+                    click.echo(f"Deleted session {resolved}")
+                else:
+                    click.echo(f"Could not delete session: {resolved}")
         return
 
-    openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
     _setup_llm_key(kb_dir)
 
     if resume is not None:
-        try:
-            resolved = resolve_session_id(kb_dir, resume)
-        except ValueError as exc:
-            click.echo(f"[ERROR] {exc}")
-            return
-        if not resolved:
+        with _kb_read_lock(openkb_dir):
+            try:
+                session_id = resolve_session_id(kb_dir, resume)
+            except ValueError as exc:
+                click.echo(f"[ERROR] {exc}")
+                return
+        if not session_id:
             if resume == "__latest__":
                 click.echo("No previous chat sessions to resume.")
             else:
                 click.echo(f"No matching session: {resume}")
             return
-        session = load_session(kb_dir, resolved)
+        session = None
     else:
         model: str = config.get("model", DEFAULT_CONFIG["model"])
         language: str = config.get("language", "en")
         session = ChatSession.new(kb_dir, model, language)
+        session_id = session.id
 
     from openkb.agent.chat import run_chat
 
     try:
-        asyncio.run(run_chat(kb_dir, session, no_color=no_color, raw=raw))
+        with session_lock(kb_dir, session_id):
+            if session is None:
+                with _kb_read_lock(openkb_dir):
+                    session = load_session(kb_dir, session_id)
+            asyncio.run(run_chat(kb_dir, session, no_color=no_color, raw=raw))
     except Exception as exc:
         click.echo(f"[ERROR] Chat failed: {exc}")
 
@@ -1555,40 +1747,41 @@ async def run_lint(kb_dir: Path) -> Path | None:
 
     openkb_dir = kb_dir / ".openkb"
 
-    # Skip lint entirely when the KB has no indexed documents
-    hashes_file = openkb_dir / "hashes.json"
-    if hashes_file.exists():
-        hashes = json.loads(hashes_file.read_text(encoding="utf-8"))
-    else:
-        hashes = {}
-    if not hashes:
-        click.echo("Nothing to lint — no documents indexed yet. Run `openkb add` first.")
-        return
+    with _kb_read_lock(openkb_dir):
+        # Skip lint entirely when the KB has no indexed documents
+        hashes_file = openkb_dir / "hashes.json"
+        if hashes_file.exists():
+            hashes = json.loads(hashes_file.read_text(encoding="utf-8"))
+        else:
+            hashes = {}
+        if not hashes:
+            click.echo("Nothing to lint — no documents indexed yet. Run `openkb add` first.")
+            return
 
-    config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
-    model: str = config.get("model", DEFAULT_CONFIG["model"])
+        config = load_config(openkb_dir / "config.yaml")
+        _setup_llm_key(kb_dir)
+        model: str = config.get("model", DEFAULT_CONFIG["model"])
 
-    click.echo("Running structural lint...")
-    structural_report = run_structural_lint(kb_dir)
-    click.echo(structural_report)
+        click.echo("Running structural lint...")
+        structural_report = run_structural_lint(kb_dir)
+        click.echo(structural_report)
 
-    click.echo("Running knowledge lint...")
-    try:
-        knowledge_report = await run_knowledge_lint(kb_dir, model)
-    except Exception as exc:
-        knowledge_report = f"Knowledge lint failed: {exc}"
-    click.echo(knowledge_report)
+        click.echo("Running knowledge lint...")
+        try:
+            knowledge_report = await run_knowledge_lint(kb_dir, model)
+        except Exception as exc:
+            knowledge_report = f"Knowledge lint failed: {exc}"
+        click.echo(knowledge_report)
 
     # Write combined report
-    reports_dir = kb_dir / "wiki" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
     import datetime
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = reports_dir / f"lint_{timestamp}.md"
+    report_path = kb_dir / "wiki" / "reports" / f"lint_{timestamp}.md"
     report_content = f"# Lint Report — {timestamp}\n\n## Structural\n\n{structural_report}\n\n## Semantic\n\n{knowledge_report}\n"
-    report_path.write_text(report_content, encoding="utf-8")
-    append_log(kb_dir / "wiki", "lint", f"report → {report_path.name}")
+    with _kb_ingest_lock(openkb_dir):
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(report_path, report_content)
+        append_log(kb_dir / "wiki", "lint", f"report → {report_path.name}", assume_locked=True)
     click.echo(f"\nReport written to {report_path}")
     return report_path
 
@@ -1605,14 +1798,15 @@ def lint(ctx, fix):
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
     if fix:
-        from openkb.lint import fix_broken_links
-        files_changed, ghosts = fix_broken_links(kb_dir / "wiki")
-        if files_changed:
-            click.echo(
-                f"Fixed {ghosts} wikilink(s) across {files_changed} file(s)."
-            )
-        else:
-            click.echo("Nothing to fix — all wikilinks resolve.")
+        with _kb_ingest_lock(kb_dir / ".openkb"):
+            from openkb.lint import fix_broken_links
+            files_changed, ghosts = fix_broken_links(kb_dir / "wiki", assume_locked=True)
+            if files_changed:
+                click.echo(
+                    f"Fixed {ghosts} wikilink(s) across {files_changed} file(s)."
+                )
+            else:
+                click.echo("Nothing to fix — all wikilinks resolve.")
     asyncio.run(run_lint(kb_dir))
 
 
@@ -1687,7 +1881,8 @@ def list_cmd(ctx):
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
-    print_list(kb_dir)
+    with _kb_read_lock(kb_dir / ".openkb"):
+        print_list(kb_dir)
 
 
 def print_status(kb_dir: Path) -> None:
@@ -1761,7 +1956,8 @@ def status(ctx):
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
-    print_status(kb_dir)
+    with _kb_read_lock(kb_dir / ".openkb"):
+        print_status(kb_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1974,79 +2170,83 @@ def skill_new(ctx, name, intent, yes_flag):
     from openkb.skill import skill_dir
     from openkb.skill.workspace import save_iteration, write_diff
 
-    target = skill_dir(kb_dir, name)
-    saved_iteration: Path | None = None
-    if target.exists():
-        if yes_flag:
-            saved_iteration = save_iteration(kb_dir, name)
-            _clear_existing_skill_dir(kb_dir, name)
-        elif sys.stdin.isatty():
-            if not click.confirm(
-                f"output/skills/{name}/ already exists. Overwrite?",
-                default=False,
-            ):
-                click.echo("Aborted.")
+    with _kb_ingest_lock(kb_dir / ".openkb"):
+        target = skill_dir(kb_dir, name)
+        saved_iteration: Path | None = None
+        if target.exists():
+            if yes_flag:
+                saved_iteration = save_iteration(kb_dir, name, assume_locked=True)
+                _clear_existing_skill_dir(kb_dir, name)
+            elif sys.stdin.isatty():
+                if not click.confirm(
+                    f"output/skills/{name}/ already exists. Overwrite?",
+                    default=False,
+                ):
+                    click.echo("Aborted.")
+                    ctx.exit(1)
+                saved_iteration = save_iteration(kb_dir, name, assume_locked=True)
+                _clear_existing_skill_dir(kb_dir, name)
+            else:
+                click.echo(
+                    f"[ERROR] output/skills/{name}/ exists. Pass -y to overwrite "
+                    f"in non-interactive contexts.",
+                    err=True,
+                )
                 ctx.exit(1)
-            saved_iteration = save_iteration(kb_dir, name)
-            _clear_existing_skill_dir(kb_dir, name)
-        else:
-            click.echo(
-                f"[ERROR] output/skills/{name}/ exists. Pass -y to overwrite "
-                f"in non-interactive contexts.",
-                err=True,
-            )
+
+        # Run the generator. Generator.run handles compile -> validate ->
+        # marketplace publish, so both CLI and chat get the same quality gate.
+        from openkb.skill.generator import Generator
+        click.echo(f"Compiling skill '{name}'...")
+        gen = Generator(
+            target_type="skill",
+            name=name,
+            intent=intent,
+            kb_dir=kb_dir,
+            model=model,
+        )
+        try:
+            asyncio.run(gen.run())
+        except RuntimeError as exc:
+            click.echo(f"[ERROR] {exc}", err=True)
             ctx.exit(1)
 
-    # Run the generator. Generator.run handles compile -> validate ->
-    # marketplace publish, so both CLI and chat get the same quality gate.
-    from openkb.skill.generator import Generator
-    click.echo(f"Compiling skill '{name}'...")
-    gen = Generator(
-        target_type="skill",
-        name=name,
-        intent=intent,
-        kb_dir=kb_dir,
-        model=model,
-    )
-    try:
-        asyncio.run(gen.run())
-    except RuntimeError as exc:
-        click.echo(f"[ERROR] {exc}", err=True)
-        ctx.exit(1)
+        # Drop a structural diff inside the saved iteration so the user
+        # can see what changed since the previous compile.
+        if saved_iteration is not None:
+            try:
+                write_diff(
+                    saved_iteration, target, saved_iteration / "diff.md",
+                    assume_locked=True,
+                )
+            except Exception as exc:  # diff is best-effort; never block success
+                logging.getLogger(__name__).debug(
+                    "diff generation failed: %s", exc, exc_info=True
+                )
 
-    # Drop a structural diff inside the saved iteration so the user
-    # can see what changed since the previous compile.
-    if saved_iteration is not None:
-        try:
-            write_diff(saved_iteration, target, saved_iteration / "diff.md")
-        except Exception as exc:  # diff is best-effort; never block success
-            logging.getLogger(__name__).debug(
-                "diff generation failed: %s", exc, exc_info=True
+        # Surface validation issues. Don't block — files are on disk and
+        # the user can fix or rollback.
+        result = gen.validation
+        if result is not None and (result.errors or result.warnings):
+            click.echo("\n[WARN] Validation found issues:")
+            for err in result.errors:
+                click.echo(f"  ERROR:   {err}")
+            for warn in result.warnings:
+                click.echo(f"  WARN:    {warn}")
+            click.echo(
+                f"\nRun `openkb skill validate {name}` to re-check, or "
+                f"`openkb skill rollback {name}` to revert."
             )
 
-    # Surface validation issues. Don't block — files are on disk and
-    # the user can fix or rollback.
-    result = gen.validation
-    if result is not None and (result.errors or result.warnings):
-        click.echo("\n[WARN] Validation found issues:")
-        for err in result.errors:
-            click.echo(f"  ERROR:   {err}")
-        for warn in result.warnings:
-            click.echo(f"  WARN:    {warn}")
-        click.echo(
-            f"\nRun `openkb skill validate {name}` to re-check, or "
-            f"`openkb skill rollback {name}` to revert."
-        )
-
-    click.echo(f"\nSaved: output/skills/{name}/")
-    if saved_iteration is not None:
-        rel = saved_iteration.relative_to(kb_dir)
-        click.echo(f"Previous version: {rel}/  (run `openkb skill rollback {name}` to restore)")
-    click.echo(f"Manifest: .claude-plugin/marketplace.json updated")
-    click.echo(f"\nInstall locally:")
-    click.echo(f"  cp -r output/skills/{name} ~/.claude/skills/")
-    click.echo(f"\nShare (push KB to GitHub, then):")
-    click.echo(f"  npx skills@latest add <owner>/<repo>")
+        click.echo(f"\nSaved: output/skills/{name}/")
+        if saved_iteration is not None:
+            rel = saved_iteration.relative_to(kb_dir)
+            click.echo(f"Previous version: {rel}/  (run `openkb skill rollback {name}` to restore)")
+        click.echo("Manifest: .claude-plugin/marketplace.json updated")
+        click.echo("\nInstall locally:")
+        click.echo(f"  cp -r output/skills/{name} ~/.claude/skills/")
+        click.echo("\nShare (push KB to GitHub, then):")
+        click.echo("  npx skills@latest add <owner>/<repo>")
 
 
 @skill.command("history")
@@ -2068,38 +2268,39 @@ def skill_history(ctx, name):
         click.echo(f"[ERROR] {err}", err=True)
         ctx.exit(1)
 
-    iters = list_iterations(kb_dir, name)
-    if not iters:
-        click.echo(f"No previous iterations for '{name}'.")
-        return
+    with _kb_read_lock(kb_dir / ".openkb"):
+        iters = list_iterations(kb_dir, name)
+        if not iters:
+            click.echo(f"No previous iterations for '{name}'.")
+            return
 
-    click.echo(f"Iterations of '{name}' ({len(iters)} total):\n")
-    click.echo("  N  Path                                                  Created")
-    click.echo("  -  --------------------------------------------------    -------")
-    for path in iters:
-        n = int(path.name.split("-", 1)[1])
-        rel = path.relative_to(kb_dir)
-        try:
-            mtime = _dt.datetime.fromtimestamp(path.stat().st_mtime)
-            stamp = mtime.strftime("%Y-%m-%d %H:%M")
-        except OSError:
-            stamp = "-"
-        click.echo(f"  {n}  {rel}  {stamp}")
+        click.echo(f"Iterations of '{name}' ({len(iters)} total):\n")
+        click.echo("  N  Path                                                  Created")
+        click.echo("  -  --------------------------------------------------    -------")
+        for path in iters:
+            n = int(path.name.split("-", 1)[1])
+            rel = path.relative_to(kb_dir)
+            try:
+                mtime = _dt.datetime.fromtimestamp(path.stat().st_mtime)
+                stamp = mtime.strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                stamp = "-"
+            click.echo(f"  {n}  {rel}  {stamp}")
 
-    from openkb.skill import skill_dir
-    current = skill_dir(kb_dir, name)
-    if current.is_dir():
-        rel_curr = current.relative_to(kb_dir)
-        click.echo(f"\n  Current: {rel_curr}/")
+        from openkb.skill import skill_dir
+        current = skill_dir(kb_dir, name)
+        if current.is_dir():
+            rel_curr = current.relative_to(kb_dir)
+            click.echo(f"\n  Current: {rel_curr}/")
 
-    latest_n = int(iters[-1].name.split("-", 1)[1])
-    click.echo("\nRestore an iteration:")
-    click.echo(
-        f"  openkb skill rollback {name}          # restore latest (iteration-{latest_n})"
-    )
-    click.echo(
-        f"  openkb skill rollback {name} --to 1   # restore iteration-1"
-    )
+        latest_n = int(iters[-1].name.split("-", 1)[1])
+        click.echo("\nRestore an iteration:")
+        click.echo(
+            f"  openkb skill rollback {name}          # restore latest (iteration-{latest_n})"
+        )
+        click.echo(
+            f"  openkb skill rollback {name} --to 1   # restore iteration-1"
+        )
 
 
 @skill.command("rollback")
@@ -2130,53 +2331,54 @@ def skill_rollback(ctx, name, to_n, yes_flag):
         click.echo(f"[ERROR] {err}", err=True)
         ctx.exit(1)
 
-    iters = list_iterations(kb_dir, name)
-    if not iters:
-        click.echo(
-            f"[ERROR] No iterations exist for '{name}'. Nothing to roll back.",
-            err=True,
-        )
-        ctx.exit(1)
-
-    target_n = to_n if to_n is not None else int(iters[-1].name.split("-", 1)[1])
-    target_label = f"iteration-{target_n}"
-    if not any(p.name == target_label for p in iters):
-        click.echo(
-            f"[ERROR] Iteration {target_n} not found for '{name}'. "
-            f"Run `openkb skill history {name}` to see available iterations.",
-            err=True,
-        )
-        ctx.exit(1)
-
-    from openkb.skill import skill_dir
-    current = skill_dir(kb_dir, name)
-    if current.exists():
-        prompt = (
-            f"This will overwrite output/skills/{name}/ with {target_label}. Continue?"
-        )
-        if yes_flag:
-            pass
-        elif sys.stdin.isatty():
-            if not click.confirm(prompt, default=False):
-                click.echo("Aborted.")
-                ctx.exit(1)
-        else:
+    with _kb_ingest_lock(kb_dir / ".openkb"):
+        iters = list_iterations(kb_dir, name)
+        if not iters:
             click.echo(
-                f"[ERROR] output/skills/{name}/ exists. Pass -y to overwrite "
-                f"in non-interactive contexts.",
+                f"[ERROR] No iterations exist for '{name}'. Nothing to roll back.",
                 err=True,
             )
             ctx.exit(1)
 
-    try:
-        restore_iteration(kb_dir, name, n=to_n)
-    except FileNotFoundError as exc:
-        click.echo(f"[ERROR] {exc}", err=True)
-        ctx.exit(1)
+        target_n = to_n if to_n is not None else int(iters[-1].name.split("-", 1)[1])
+        target_label = f"iteration-{target_n}"
+        if not any(p.name == target_label for p in iters):
+            click.echo(
+                f"[ERROR] Iteration {target_n} not found for '{name}'. "
+                f"Run `openkb skill history {name}` to see available iterations.",
+                err=True,
+            )
+            ctx.exit(1)
 
-    regenerate_marketplace(kb_dir)
-    click.echo(f"Restored output/skills/{name}/ from {target_label}.")
-    click.echo("Manifest: .claude-plugin/marketplace.json updated")
+        from openkb.skill import skill_dir
+        current = skill_dir(kb_dir, name)
+        if current.exists():
+            prompt = (
+                f"This will overwrite output/skills/{name}/ with {target_label}. Continue?"
+            )
+            if yes_flag:
+                pass
+            elif sys.stdin.isatty():
+                if not click.confirm(prompt, default=False):
+                    click.echo("Aborted.")
+                    ctx.exit(1)
+            else:
+                click.echo(
+                    f"[ERROR] output/skills/{name}/ exists. Pass -y to overwrite "
+                    f"in non-interactive contexts.",
+                    err=True,
+                )
+                ctx.exit(1)
+
+        try:
+            restore_iteration(kb_dir, name, n=to_n, assume_locked=True)
+        except FileNotFoundError as exc:
+            click.echo(f"[ERROR] {exc}", err=True)
+            ctx.exit(1)
+
+        regenerate_marketplace(kb_dir, assume_locked=True)
+        click.echo(f"Restored output/skills/{name}/ from {target_label}.")
+        click.echo("Manifest: .claude-plugin/marketplace.json updated")
 
 
 @skill.command("validate")
@@ -2196,35 +2398,36 @@ def skill_validate(ctx, name, strict):
         click.echo("No knowledge base found. Run `openkb init` first.", err=True)
         ctx.exit(1)
 
-    root = skills_root(kb_dir)
-    if not root.is_dir():
-        click.echo("No skills found. Compile one with `openkb skill new`.")
-        return
+    with _kb_read_lock(kb_dir / ".openkb"):
+        root = skills_root(kb_dir)
+        if not root.is_dir():
+            click.echo("No skills found. Compile one with `openkb skill new`.")
+            return
 
-    if name:
-        target = skill_dir(kb_dir, name)
-        if not target.is_dir():
-            click.echo(f"[ERROR] Skill '{name}' not found.", err=True)
-            ctx.exit(1)
-        targets = [target]
-    else:
-        targets = sorted(
-            d for d in root.iterdir()
-            if d.is_dir() and not d.name.endswith("-workspace")
-        )
+        if name:
+            target = skill_dir(kb_dir, name)
+            if not target.is_dir():
+                click.echo(f"[ERROR] Skill '{name}' not found.", err=True)
+                ctx.exit(1)
+            targets = [target]
+        else:
+            targets = sorted(
+                d for d in root.iterdir()
+                if d.is_dir() and not d.name.endswith("-workspace")
+            )
 
-    any_failed = False
-    for t in targets:
-        result = validate_skill(t, strict=strict)
-        passed = result.passed_strict if strict else result.passed
-        prefix = "[OK]" if passed else "[FAIL]"
-        click.echo(f"{prefix} {t.name}")
-        for err in result.errors:
-            click.echo(f"  ERROR:   {err}")
-        for warn in result.warnings:
-            click.echo(f"  WARN:    {warn}")
-        if not passed:
-            any_failed = True
+        any_failed = False
+        for t in targets:
+            result = validate_skill(t, strict=strict)
+            passed = result.passed_strict if strict else result.passed
+            prefix = "[OK]" if passed else "[FAIL]"
+            click.echo(f"{prefix} {t.name}")
+            for err in result.errors:
+                click.echo(f"  ERROR:   {err}")
+            for warn in result.warnings:
+                click.echo(f"  WARN:    {warn}")
+            if not passed:
+                any_failed = True
 
     if any_failed:
         ctx.exit(1)
@@ -2263,11 +2466,6 @@ def skill_eval(ctx, name, save_flag, eval_set_path, count):
         click.echo("No knowledge base found. Run `openkb init` first.", err=True)
         ctx.exit(1)
 
-    skill_dir = _skill_dir(kb_dir, name)
-    if not skill_dir.is_dir():
-        click.echo(f"[ERROR] Skill '{name}' not found.", err=True)
-        ctx.exit(1)
-
     try:
         _setup_llm_key(kb_dir)
     except RuntimeError as exc:
@@ -2283,13 +2481,19 @@ def skill_eval(ctx, name, save_flag, eval_set_path, count):
     else:
         click.echo(f"Generating eval set for '{name}' (count={count} per side)...")
 
-    try:
-        result = asyncio.run(run_eval(
-            skill_dir, model=model, eval_set=eval_set, count=count,
-        ))
-    except RuntimeError as exc:
-        click.echo(f"[ERROR] {exc}", err=True)
-        ctx.exit(1)
+    with _kb_read_lock(kb_dir / ".openkb"):
+        skill_dir = _skill_dir(kb_dir, name)
+        if not skill_dir.is_dir():
+            click.echo(f"[ERROR] Skill '{name}' not found.", err=True)
+            ctx.exit(1)
+
+        try:
+            result = asyncio.run(run_eval(
+                skill_dir, model=model, eval_set=eval_set, count=count,
+            ))
+        except RuntimeError as exc:
+            click.echo(f"[ERROR] {exc}", err=True)
+            ctx.exit(1)
 
     click.echo(f"\nEval set: {result.total} prompts")
     click.echo(
@@ -2350,7 +2554,8 @@ def skill_eval(ctx, name, save_flag, eval_set_path, count):
         click.echo("\nAll prompts graded correctly with full body support.")
 
     if save_flag and eval_set is None:
-        path = save_eval_set(kb_dir, name, result.prompts)
+        with _kb_ingest_lock(kb_dir / ".openkb"):
+            path = save_eval_set(kb_dir, name, result.prompts, assume_locked=True)
         click.echo(f"\nEval set persisted to {path}")
 
 

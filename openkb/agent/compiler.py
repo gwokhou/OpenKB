@@ -31,6 +31,7 @@ import litellm
 import yaml
 
 from openkb.config import DEFAULT_ENTITY_TYPES, resolve_entity_types
+from openkb.locks import kb_ingest_lock, maybe_kb_ingest_lock
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
 from openkb.schema import INDEX_SEED, get_agents_md
 
@@ -1156,6 +1157,7 @@ def _remove_doc_from_pages(
     *,
     page_dir: str,
     keep_empty: bool = False,
+    assume_locked: bool = False,
 ) -> dict[str, list[str]]:
     """Update or delete pages in ``page_dir`` affected by removing a document.
 
@@ -1177,6 +1179,14 @@ def _remove_doc_from_pages(
     Returns ``{"modified": [slugs...], "deleted": [slugs...]}``.
     """
     pages_dir = wiki_dir / page_dir
+    kb_dir = wiki_dir.parent if (wiki_dir.parent / ".openkb").is_dir() else None
+    if not assume_locked:
+        with maybe_kb_ingest_lock(kb_dir):
+            return _remove_doc_from_pages(
+                wiki_dir, doc_name, page_dir=page_dir,
+                keep_empty=keep_empty, assume_locked=True,
+            )
+
     if not pages_dir.is_dir():
         return {"modified": [], "deleted": []}
 
@@ -1267,6 +1277,7 @@ def remove_doc_from_concept_pages(
     doc_name: str,
     *,
     keep_empty: bool = False,
+    assume_locked: bool = False,
 ) -> dict[str, list[str]]:
     """Update or delete concept pages affected by removing a document.
 
@@ -1277,6 +1288,7 @@ def remove_doc_from_concept_pages(
     """
     return _remove_doc_from_pages(
         wiki_dir, doc_name, page_dir="concepts", keep_empty=keep_empty,
+        assume_locked=assume_locked,
     )
 
 
@@ -1285,6 +1297,7 @@ def remove_doc_from_entity_pages(
     doc_name: str,
     *,
     keep_empty: bool = False,
+    assume_locked: bool = False,
 ) -> dict[str, list[str]]:
     """Update or delete entity pages affected by removing a document.
 
@@ -1293,11 +1306,18 @@ def remove_doc_from_entity_pages(
     """
     return _remove_doc_from_pages(
         wiki_dir, doc_name, page_dir="entities", keep_empty=keep_empty,
+        assume_locked=assume_locked,
     )
 
 
-def remove_doc_from_index(wiki_dir: Path, doc_name: str, concept_slugs_deleted: list[str],
-                          entity_slugs_deleted: list[str] | None = None) -> None:
+def remove_doc_from_index(
+    wiki_dir: Path,
+    doc_name: str,
+    concept_slugs_deleted: list[str],
+    entity_slugs_deleted: list[str] | None = None,
+    *,
+    assume_locked: bool = False,
+) -> None:
     """Remove the document's entry from ``index.md`` along with any concept
     and entity entries for pages that were deleted as a side effect.
 
@@ -1305,6 +1325,17 @@ def remove_doc_from_index(wiki_dir: Path, doc_name: str, concept_slugs_deleted: 
     when their last entry is removed — adding a new doc later repopulates
     them.
     """
+    kb_dir = wiki_dir.parent if (wiki_dir.parent / ".openkb").is_dir() else None
+    if not assume_locked:
+        with maybe_kb_ingest_lock(kb_dir):
+            return remove_doc_from_index(
+                wiki_dir,
+                doc_name,
+                concept_slugs_deleted,
+                entity_slugs_deleted,
+                assume_locked=True,
+            )
+
     index_path = wiki_dir / "index.md"
     if not index_path.exists():
         return
@@ -1984,12 +2015,24 @@ async def compile_short_doc(
     kb_dir: Path,
     model: str,
     max_concurrency: int = DEFAULT_COMPILE_CONCURRENCY,
+    assume_locked: bool = False,
 ) -> None:
     """Compile a short document using a multi-step LLM pipeline with caching.
 
     Step 1: Build base context A (schema + doc content), generate summary.
     Steps 2-4: Delegated to ``_compile_concepts``.
     """
+    if not assume_locked:
+        with kb_ingest_lock(kb_dir / ".openkb"):
+            return await compile_short_doc(
+                doc_name,
+                source_path,
+                kb_dir,
+                model,
+                max_concurrency=max_concurrency,
+                assume_locked=True,
+            )
+
     from openkb.config import load_config
 
     openkb_dir = kb_dir / ".openkb"
@@ -2047,12 +2090,26 @@ async def compile_long_doc(
     model: str,
     doc_description: str = "",
     max_concurrency: int = DEFAULT_COMPILE_CONCURRENCY,
+    assume_locked: bool = False,
 ) -> None:
     """Compile a long (PageIndex) document's concepts and index.
 
     The summary page is already written by the indexer. This function
     generates concept pages and updates the index.
     """
+    if not assume_locked:
+        with kb_ingest_lock(kb_dir / ".openkb"):
+            return await compile_long_doc(
+                doc_name,
+                summary_path,
+                doc_id,
+                kb_dir,
+                model,
+                doc_description=doc_description,
+                max_concurrency=max_concurrency,
+                assume_locked=True,
+            )
+
     from openkb.config import load_config
 
     openkb_dir = kb_dir / ".openkb"

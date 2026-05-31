@@ -416,7 +416,12 @@ async def _run_turn(
     answer = "".join(collected).strip()
     if not answer:
         answer = (result.final_output or "").strip()
-    session.record_turn(user_input, answer, result.to_input_list())
+    session.record_turn(
+        user_input,
+        answer,
+        result.to_input_list(),
+        assume_locked=True,
+    )
 
 
 def _save_transcript(kb_dir: Path, session: ChatSession, name: str | None) -> Path:
@@ -528,39 +533,40 @@ async def _handle_slash_skill(arg: str, kb_dir: Path, style: Style) -> None:
     # Use the same safety gates as the CLI (name validation, wiki dir,
     # wiki content). Chat doesn't have a -y flag, so existing skills
     # block with a clear instruction to delete first.
-    from openkb.cli import _preflight_skill_new
+    from openkb.cli import _kb_ingest_lock, _preflight_skill_new
     err = _preflight_skill_new(kb_dir, name)
     if err:
         _fmt(style, ("class:error", f"[ERROR] {err}\n"))
         return
 
     from openkb.skill import skill_dir
-    target = skill_dir(kb_dir, name)
-    if target.exists():
-        _fmt(style, ("class:error",
-            f"[ERROR] output/skills/{name}/ already exists. Remove it first "
-            f"with `rm -rf output/skills/{name}` and re-run.\n"))
-        return
+    with _kb_ingest_lock(kb_dir / ".openkb"):
+        target = skill_dir(kb_dir, name)
+        if target.exists():
+            _fmt(style, ("class:error",
+                f"[ERROR] output/skills/{name}/ already exists. Remove it first "
+                f"with `rm -rf output/skills/{name}` and re-run.\n"))
+            return
 
-    # Load model from KB config
-    from openkb.config import load_config, DEFAULT_CONFIG
-    config = load_config(kb_dir / ".openkb" / "config.yaml")
-    model = config.get("model", DEFAULT_CONFIG["model"])
+        # Load model from KB config
+        from openkb.config import load_config, DEFAULT_CONFIG
+        config = load_config(kb_dir / ".openkb" / "config.yaml")
+        model = config.get("model", DEFAULT_CONFIG["model"])
 
-    from openkb.skill.generator import Generator
-    _fmt(style, ("class:slash.help", f"Compiling skill '{name}'...\n"))
-    gen = Generator(
-        target_type="skill",
-        name=name,
-        intent=intent,
-        kb_dir=kb_dir,
-        model=model,
-    )
-    try:
-        await gen.run()
-    except RuntimeError as exc:
-        _fmt(style, ("class:error", f"[ERROR] {exc}\n"))
-        return
+        from openkb.skill.generator import Generator
+        _fmt(style, ("class:slash.help", f"Compiling skill '{name}'...\n"))
+        gen = Generator(
+            target_type="skill",
+            name=name,
+            intent=intent,
+            kb_dir=kb_dir,
+            model=model,
+        )
+        try:
+            await gen.run()
+        except RuntimeError as exc:
+            _fmt(style, ("class:error", f"[ERROR] {exc}\n"))
+            return
 
     # Surface validation issues from Generator.run. Unlike the CLI
     # (which exits 1 on validation errors), chat is interactive — print
@@ -733,18 +739,22 @@ async def _handle_slash(
         if not session.user_turns:
             _fmt(style, ("class:error", "Nothing to save yet.\n"))
             return None
-        path = _save_transcript(kb_dir, session, arg or None)
+        from openkb.cli import _kb_ingest_lock
+        with _kb_ingest_lock(kb_dir / ".openkb"):
+            path = _save_transcript(kb_dir, session, arg or None)
         _fmt(style, ("class:slash.ok", f"Saved to {path}\n"))
         return None
 
     if head == "/status":
-        from openkb.cli import print_status
-        print_status(kb_dir)
+        from openkb.cli import _kb_read_lock, print_status
+        with _kb_read_lock(kb_dir / ".openkb"):
+            print_status(kb_dir)
         return None
 
     if head == "/list":
-        from openkb.cli import print_list
-        print_list(kb_dir)
+        from openkb.cli import _kb_read_lock, print_list
+        with _kb_read_lock(kb_dir / ".openkb"):
+            print_list(kb_dir)
         return None
 
     if head == "/lint":
@@ -899,9 +909,13 @@ async def run_chat(
                 prompt_session = _make_prompt_session(session, style, use_color, kb_dir)
             continue
 
-        append_log(kb_dir / "wiki", "query", user_input)
         try:
-            await _run_turn(agent, session, user_input, style, use_color=use_color, raw=raw)
+            from openkb.cli import _kb_ingest_lock
+            with _kb_ingest_lock(kb_dir / ".openkb"):
+                append_log(kb_dir / "wiki", "query", user_input, assume_locked=True)
+                await _run_turn(
+                    agent, session, user_input, style, use_color=use_color, raw=raw,
+                )
         except KeyboardInterrupt:
             _fmt(style, ("class:error", "\n[aborted]\n"))
         except Exception as exc:

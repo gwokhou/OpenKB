@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 
 class HashRegistry:
@@ -70,8 +71,18 @@ class HashRegistry:
 
     def _persist(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("w", encoding="utf-8") as fh:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=self._path.parent,
+            prefix=f".{self._path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
             json.dump(self._data, fh, indent=2)
+            fh.flush()
+        tmp_path.replace(self._path)
 
     # ------------------------------------------------------------------
     # Static utility

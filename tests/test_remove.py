@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -441,6 +442,28 @@ def test_cli_remove_preview_handles_json_quoted_sources(kb_dir):
     assert result.exit_code == 0, result.output
     assert "DELETE   wiki/entities/vaswani.md" in result.output
     assert "MODIFY   wiki/concepts/quoted-concept.md" in result.output
+
+
+def test_cli_remove_uses_ingest_lock(kb_dir):
+    _seed_two_doc_kb(kb_dir)
+    events = []
+
+    @contextmanager
+    def fake_lock(openkb_dir):
+        events.append(("enter", openkb_dir))
+        try:
+            yield
+        finally:
+            events.append(("exit", openkb_dir))
+
+    with patch("openkb.cli._kb_ingest_lock", side_effect=fake_lock):
+        result = _invoke(kb_dir, ["remove", "attention.pdf", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert events == [
+        ("enter", kb_dir / ".openkb"),
+        ("exit", kb_dir / ".openkb"),
+    ]
 
 
 def test_cli_remove_yes_executes_full_plan(kb_dir):

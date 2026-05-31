@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from openkb.locks import maybe_kb_ingest_lock
 from openkb.agent.tools import (
     get_wiki_page_content as _get_wiki_page_content,
     list_wiki_files as _list_wiki_files,
@@ -75,7 +76,9 @@ def read_skill_image(path: str, wiki_root: str) -> dict:
     return _read_wiki_image(path, wiki_root)
 
 
-def write_skill_file(path: str, content: str, skill_root: str) -> str:
+def write_skill_file(
+    path: str, content: str, skill_root: str, *, assume_locked: bool = False
+) -> str:
     """Write a file under the skill directory.
 
     Args:
@@ -91,6 +94,17 @@ def write_skill_file(path: str, content: str, skill_root: str) -> str:
     full = (root / path).resolve()
     if not full.is_relative_to(root):
         return "Access denied: path escapes skill root."
-    full.parent.mkdir(parents=True, exist_ok=True)
-    full.write_text(content, encoding="utf-8")
+    kb_dir = _kb_dir_for_skill_root(root)
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content, encoding="utf-8")
     return f"Written: {path}"
+
+
+def _kb_dir_for_skill_root(skill_root: Path) -> Path | None:
+    parts = skill_root.parts
+    if len(parts) >= 4 and parts[-3:-1] == ("output", "skills"):
+        kb_dir = Path(*parts[:-3])
+        if (kb_dir / ".openkb").is_dir():
+            return kb_dir
+    return None

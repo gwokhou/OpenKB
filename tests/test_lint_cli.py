@@ -1,6 +1,7 @@
 """Tests for the openkb lint CLI command."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -73,3 +74,43 @@ class TestLintCommand:
         assert "Running structural lint" in result.output
         assert "Running knowledge lint" in result.output
         assert "Report written to" in result.output
+
+    def test_lint_uses_read_lock_then_short_ingest_lock(self, tmp_path):
+        kb_dir = _setup_kb(tmp_path)
+        hashes = {"abc": {"name": "paper.pdf", "type": "pdf"}}
+        (kb_dir / ".openkb" / "hashes.json").write_text(json.dumps(hashes))
+        events = []
+
+        @contextmanager
+        def fake_read_lock(openkb_dir):
+            events.append(("read-enter", openkb_dir))
+            try:
+                yield
+            finally:
+                events.append(("read-exit", openkb_dir))
+
+        @contextmanager
+        def fake_ingest_lock(openkb_dir):
+            events.append(("write-enter", openkb_dir))
+            try:
+                yield
+            finally:
+                events.append(("write-exit", openkb_dir))
+
+        runner = CliRunner()
+        with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
+             patch("openkb.cli._setup_llm_key"), \
+             patch("openkb.agent.linter.run_knowledge_lint", return_value="No issues."), \
+             patch("openkb.cli._kb_read_lock", side_effect=fake_read_lock), \
+             patch("openkb.cli._kb_ingest_lock", side_effect=fake_ingest_lock):
+            result = runner.invoke(cli, ["lint", "--fix"])
+
+        assert result.exit_code == 0, result.output
+        assert events == [
+            ("write-enter", kb_dir / ".openkb"),
+            ("write-exit", kb_dir / ".openkb"),
+            ("read-enter", kb_dir / ".openkb"),
+            ("read-exit", kb_dir / ".openkb"),
+            ("write-enter", kb_dir / ".openkb"),
+            ("write-exit", kb_dir / ".openkb"),
+        ]

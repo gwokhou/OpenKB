@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import yaml
@@ -368,3 +369,39 @@ class TestQuerySaveGhostStrip:
         assert "rnn" in saved
         assert "[[concepts/multi-head-attention]]" not in saved
         assert "multi head attention" in saved
+
+    def test_save_uses_unique_filename_when_slug_exists(self, kb_dir):
+        answer = "Plain answer."
+        explore_dir = kb_dir / "wiki" / "explorations"
+        explore_dir.mkdir(parents=True, exist_ok=True)
+        existing = explore_dir / "transformers.md"
+        existing.write_text("existing", encoding="utf-8")
+
+        async def fake_run_query(*_args, **_kwargs):
+            return answer
+
+        events = []
+
+        @contextmanager
+        def fake_lock(openkb_dir):
+            events.append(("enter", openkb_dir))
+            try:
+                yield
+            finally:
+                events.append(("exit", openkb_dir))
+
+        with patch("openkb.cli._stream_to_tty", return_value=False), \
+             patch("openkb.agent.query.run_query", side_effect=fake_run_query), \
+             patch("openkb.cli._setup_llm_key"), \
+             patch("openkb.cli._kb_ingest_lock", side_effect=fake_lock):
+            result = CliRunner().invoke(
+                cli, ["--kb-dir", str(kb_dir), "query", "transformers", "--save"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert existing.read_text(encoding="utf-8") == "existing"
+        assert (explore_dir / "transformers-2.md").exists()
+        assert events == [
+            ("enter", kb_dir / ".openkb"),
+            ("exit", kb_dir / ".openkb"),
+        ]

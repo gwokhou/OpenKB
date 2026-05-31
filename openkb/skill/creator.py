@@ -123,7 +123,7 @@ def build_skill_create_agent(
     @function_tool
     def write_skill_file(path: str, content: str) -> str:
         """Write a file under the skill directory."""
-        return _write_skill_file_impl(path, content, skill_root)
+        return _write_skill_file_impl(path, content, skill_root, assume_locked=True)
 
     @function_tool
     def done(summary: str) -> str:

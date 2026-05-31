@@ -22,6 +22,7 @@ intentional v0.x scope.
 """
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Literal, Union
 
@@ -120,4 +121,8 @@ class Generator:
         # validation if present; otherwise fall back to None (skill didn't
         # declare a grammar to validate against).
         self.validation = deck_result.validation
+        if "assume_locked" in inspect.signature(regenerate_marketplace).parameters:
+            regenerate_marketplace(self.kb_dir, assume_locked=True)
+        else:
+            regenerate_marketplace(self.kb_dir)
         return self.output_dir

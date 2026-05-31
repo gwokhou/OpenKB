@@ -7,6 +7,8 @@ import re
 import shutil
 from pathlib import Path
 
+from openkb.locks import maybe_kb_ingest_lock
+
 logger = logging.getLogger(__name__)
 
 # Matches: ![alt](data:image/ext;base64,DATA)
@@ -16,7 +18,25 @@ _BASE64_RE = re.compile(r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)')
 _RELATIVE_RE = re.compile(r'!\[([^\]]*)\]\((?!https?://|data:)([^)]+)\)')
 
 
-def extract_base64_images(markdown: str, doc_name: str, images_dir: Path) -> str:
+def _kb_dir_for_images(images_dir: Path) -> Path | None:
+    """Return the KB root for an images directory when it is inside a KB."""
+    try:
+        resolved = images_dir.resolve()
+    except OSError:
+        resolved = images_dir.absolute()
+    for parent in (resolved, *resolved.parents):
+        if (parent / ".openkb").is_dir():
+            return parent
+    return None
+
+
+def extract_base64_images(
+    markdown: str,
+    doc_name: str,
+    images_dir: Path,
+    *,
+    assume_locked: bool = False,
+) -> str:
     """Decode base64-embedded images, save to disk, and rewrite markdown links.
 
     For each ``![alt](data:image/ext;base64,DATA)`` match:
@@ -24,6 +44,14 @@ def extract_base64_images(markdown: str, doc_name: str, images_dir: Path) -> str
     - Replace the link with ``![alt](sources/images/{doc_name}/img_NNN.ext)``
     - On decode failure: log a warning and leave the original text unchanged.
     """
+    with maybe_kb_ingest_lock(
+        _kb_dir_for_images(images_dir),
+        assume_locked=assume_locked,
+    ):
+        return _extract_base64_images_locked(markdown, doc_name, images_dir)
+
+
+def _extract_base64_images_locked(markdown: str, doc_name: str, images_dir: Path) -> str:
     counter = 0
     result = markdown
 
@@ -52,7 +80,12 @@ def extract_base64_images(markdown: str, doc_name: str, images_dir: Path) -> str
 
 
 def copy_relative_images(
-    markdown: str, source_dir: Path, doc_name: str, images_dir: Path
+    markdown: str,
+    source_dir: Path,
+    doc_name: str,
+    images_dir: Path,
+    *,
+    assume_locked: bool = False,
 ) -> str:
     """Copy locally-referenced images into the KB images directory and rewrite links.
 
@@ -62,6 +95,19 @@ def copy_relative_images(
     - Replace link with ``![alt](sources/images/{doc_name}/{filename})``
     - Missing source file: log a warning and leave the original text unchanged.
     """
+    with maybe_kb_ingest_lock(
+        _kb_dir_for_images(images_dir),
+        assume_locked=assume_locked,
+    ):
+        return _copy_relative_images_locked(markdown, source_dir, doc_name, images_dir)
+
+
+def _copy_relative_images_locked(
+    markdown: str,
+    source_dir: Path,
+    doc_name: str,
+    images_dir: Path,
+) -> str:
     result = markdown
 
     for match in _RELATIVE_RE.finditer(markdown):

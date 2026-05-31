@@ -278,6 +278,49 @@ class TestAddBatchRunner:
         assert counts == {"added": 1, "skipped": 0, "failed": 1}
         mock_convert.assert_called_once_with(doc_a, kb_dir)
 
+    def test_batch_runner_rejects_existing_doc_name_conflict(self, tmp_path):
+        from openkb.cli import _add_files_batch
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "hashes.json").write_text(json.dumps({
+            "b" * 64: {"name": "paper.pdf", "doc_name": "paper", "type": "pdf"}
+        }))
+        doc = tmp_path / "paper.md"
+        doc.write_text("# Different paper")
+
+        with patch("openkb.cli.convert_document") as mock_convert:
+            counts = _add_files_batch([doc], kb_dir, jobs=2, buffer_size=1)
+
+        assert counts == {"added": 0, "skipped": 0, "failed": 1}
+        mock_convert.assert_not_called()
+
+    def test_add_single_file_rejects_existing_doc_name_conflict(self, tmp_path):
+        from openkb.cli import add_single_file
+        from openkb.converter import ConvertResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "hashes.json").write_text(json.dumps({
+            "b" * 64: {"name": "paper.pdf", "doc_name": "paper", "type": "pdf"}
+        }))
+        doc = tmp_path / "paper.md"
+        doc.write_text("# Different paper")
+        source_path = kb_dir / "wiki" / "sources" / "paper.md"
+        source_path.write_text("# converted")
+        converted = ConvertResult(
+            raw_path=kb_dir / "raw" / "paper.md",
+            source_path=source_path,
+            is_long_doc=False,
+            file_hash="a" * 64,
+        )
+
+        with patch("openkb.cli.convert_document", return_value=converted) as mock_convert, \
+             patch("openkb.agent.compiler.compile_short_doc") as mock_compile:
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        mock_convert.assert_not_called()
+        mock_compile.assert_not_called()
+
 
 class TestWatchCommand:
     def test_watch_uses_batch_runner_for_debounced_supported_files(self, tmp_path):

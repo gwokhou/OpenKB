@@ -45,6 +45,7 @@ import yaml
 from agents import Agent, Runner
 from agents.exceptions import MaxTurnsExceeded
 
+from openkb.locks import atomic_write_json, maybe_kb_ingest_lock
 from openkb.skill import extract_body, extract_frontmatter
 
 
@@ -465,18 +466,19 @@ async def run_eval(
 
 
 def save_eval_set(
-    kb_dir: Path, skill_name: str, prompts: list[EvalPrompt],
+    kb_dir: Path, skill_name: str, prompts: list[EvalPrompt], *, assume_locked: bool = False
 ) -> Path:
     """Persist an eval set to ``<kb>/.openkb/eval-sets/<skill_name>.json``."""
-    out_dir = kb_dir / ".openkb" / "eval-sets"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{skill_name}.json"
-    data = {
-        "should_trigger": [p.question for p in prompts if p.expected == "trigger"],
-        "should_not": [p.question for p in prompts if p.expected == "no-trigger"],
-    }
-    out_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return out_path
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        out_dir = kb_dir / ".openkb" / "eval-sets"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{skill_name}.json"
+        data = {
+            "should_trigger": [p.question for p in prompts if p.expected == "trigger"],
+            "should_not": [p.question for p in prompts if p.expected == "no-trigger"],
+        }
+        atomic_write_json(out_path, data)
+        return out_path
 
 
 def load_eval_set(path: Path) -> list[EvalPrompt]:

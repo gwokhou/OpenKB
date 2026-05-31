@@ -14,6 +14,7 @@ from typing import Any
 from pageindex import IndexConfig, PageIndexClient
 
 from openkb.config import load_config
+from openkb.locks import kb_ingest_lock
 from openkb.tree_renderer import render_summary_md
 
 logger = logging.getLogger(__name__)
@@ -376,14 +377,29 @@ def _convert_pdf_to_pages(
     images_dir: Path,
     mineru_output_dir: Path,
     mineru_backend: str,
+    *,
+    assume_locked: bool = False,
 ) -> list[dict[str, Any]]:
     from openkb.pdf_parser import convert_pdf_to_pages
 
-    return convert_pdf_to_pages(pdf_path, doc_name, images_dir, mineru_output_dir, mineru_backend)
+    return convert_pdf_to_pages(
+        pdf_path,
+        doc_name,
+        images_dir,
+        mineru_output_dir,
+        mineru_backend,
+        assume_locked=assume_locked,
+    )
 
 
-def index_long_document(pdf_path: Path, kb_dir: Path) -> IndexResult:
+def index_long_document(
+    pdf_path: Path, kb_dir: Path, *, assume_locked: bool = False
+) -> IndexResult:
     """Index a long PDF document using PageIndex and write wiki pages."""
+    if not assume_locked:
+        with kb_ingest_lock(kb_dir / ".openkb"):
+            return index_long_document(pdf_path, kb_dir, assume_locked=True)
+
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
 
@@ -462,6 +478,7 @@ def index_long_document(pdf_path: Path, kb_dir: Path) -> IndexResult:
                 images_dir,
                 mineru_output_dir,
                 mineru_backend,
+                assume_locked=True,
             )
         )
 

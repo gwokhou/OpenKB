@@ -12,15 +12,20 @@ import json
 import os
 import random
 import string
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 
 _IMAGE_HISTORY_NOTE = (
     "Image output omitted from chat history to avoid persisting raw data URLs."
 )
+_SESSION_LOCKS_GUARD = threading.Lock()
+_SESSION_LOCKS: dict[Path, threading.RLock] = {}
 
 
 def _utcnow_iso() -> str:
@@ -35,6 +40,44 @@ def _gen_id() -> str:
 
 def chats_dir(kb_dir: Path) -> Path:
     return kb_dir / ".openkb" / "chats"
+
+
+def _local_session_lock(lock_path: Path) -> threading.RLock:
+    resolved = lock_path.resolve()
+    with _SESSION_LOCKS_GUARD:
+        lock = _SESSION_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.RLock()
+            _SESSION_LOCKS[resolved] = lock
+        return lock
+
+
+@contextmanager
+def session_lock(kb_dir: Path, session_id: str):
+    """Prevent concurrent writers from resuming the same chat session."""
+    import fcntl
+
+    locks_dir = kb_dir / ".openkb" / "chat-locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = locks_dir / f"{session_id}.lock"
+    with _local_session_lock(lock_path):
+        with lock_path.open("a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _kb_dir_from_session_path(path: Path) -> Path | None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    for parent in resolved.parents:
+        if parent.name == ".openkb" and parent.parent:
+            return parent.parent
+    return None
 
 
 def _title_from(msg: str, limit: int = 60) -> str:
@@ -155,13 +198,24 @@ class ChatSession:
             "assistant_texts": self.assistant_texts,
         }
 
-    def save(self) -> None:
+    def save(self, *, assume_locked: bool = False) -> None:
+        kb_dir = _kb_dir_from_session_path(self.path)
+        if not assume_locked and kb_dir is not None:
+            with session_lock(kb_dir, self.id):
+                return self.save(assume_locked=True)
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2, default=str),
+        with NamedTemporaryFile(
+            "w",
             encoding="utf-8",
-        )
+            dir=self.path.parent,
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp = Path(fh.name)
+            json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2, default=str)
+            fh.flush()
         os.replace(tmp, self.path)
 
     def record_turn(
@@ -169,7 +223,19 @@ class ChatSession:
         user_message: str,
         assistant_text: str,
         new_history: list[dict[str, Any]],
+        *,
+        assume_locked: bool = False,
     ) -> None:
+        kb_dir = _kb_dir_from_session_path(self.path)
+        if not assume_locked and kb_dir is not None:
+            with session_lock(kb_dir, self.id):
+                return self.record_turn(
+                    user_message,
+                    assistant_text,
+                    new_history,
+                    assume_locked=True,
+                )
+
         self.history = sanitize_history(new_history)
         self.user_turns.append(user_message)
         self.assistant_texts.append(assistant_text)
@@ -177,7 +243,7 @@ class ChatSession:
         if not self.title:
             self.title = _title_from(user_message)
         self.updated_at = _utcnow_iso()
-        self.save()
+        self.save(assume_locked=True)
 
 
 def load_session(kb_dir: Path, session_id: str) -> ChatSession:
@@ -251,7 +317,11 @@ def resolve_session_id(kb_dir: Path, query: str) -> str | None:
     return None
 
 
-def delete_session(kb_dir: Path, session_id: str) -> bool:
+def delete_session(kb_dir: Path, session_id: str, *, assume_locked: bool = False) -> bool:
+    if not assume_locked:
+        with session_lock(kb_dir, session_id):
+            return delete_session(kb_dir, session_id, assume_locked=True)
+
     path = chats_dir(kb_dir) / f"{session_id}.json"
     if path.exists():
         path.unlink()

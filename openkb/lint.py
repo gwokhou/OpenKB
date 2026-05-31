@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 
+from openkb.locks import maybe_kb_ingest_lock
 from openkb.schema import PAGE_CONTENT_DIRS
 
 # Matches [[wikilink]] or [[subdir/link]]
@@ -185,6 +186,7 @@ def fix_broken_links(
     wiki: Path,
     *,
     restrict_to: list[Path] | None = None,
+    assume_locked: bool = False,
 ) -> tuple[int, int]:
     """Rewrite or strip broken [[wikilinks]] across the wiki in place.
 
@@ -210,6 +212,13 @@ def fix_broken_links(
     Returns:
         Tuple of ``(files_changed, ghosts_stripped)``.
     """
+    kb_dir = wiki.parent if wiki.name == "wiki" else None
+    if not assume_locked:
+        with maybe_kb_ingest_lock(kb_dir):
+            return fix_broken_links(
+                wiki, restrict_to=restrict_to, assume_locked=True,
+            )
+
     pages = _all_wiki_pages(wiki)
     # The same fuzzy normalization _all_wiki_pages stores both the full
     # relative path (e.g. ``concepts/attention``) and the bare stem

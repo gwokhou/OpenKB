@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from openkb.config import load_config
+from openkb.locks import atomic_write_text, maybe_kb_ingest_lock
 from openkb.skill import skills_root
 
 
@@ -105,16 +106,17 @@ def _build_manifest(kb_dir: Path) -> dict[str, Any]:
     }
 
 
-def regenerate_marketplace(kb_dir: Path) -> Path:
+def regenerate_marketplace(kb_dir: Path, *, assume_locked: bool = False) -> Path:
     """Rewrite ``<kb>/.claude-plugin/marketplace.json`` from current skills.
 
     Returns the path to the manifest. Creates ``.claude-plugin/`` if needed.
     Safe to call when zero skills exist (manifest lists an empty ``skills``
     array).
     """
-    manifest = _build_manifest(kb_dir)
-    out_dir = kb_dir / ".claude-plugin"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "marketplace.json"
-    out_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    return out_path
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        manifest = _build_manifest(kb_dir)
+        out_dir = kb_dir / ".claude-plugin"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "marketplace.json"
+        atomic_write_text(out_path, json.dumps(manifest, indent=2) + "\n")
+        return out_path

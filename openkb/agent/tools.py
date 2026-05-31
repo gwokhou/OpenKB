@@ -10,6 +10,8 @@ import contextlib
 import json as _json
 from pathlib import Path
 
+from openkb.locks import maybe_kb_ingest_lock
+
 
 def list_wiki_files(directory: str, wiki_root: str) -> str:
     """List all Markdown files in a wiki subdirectory.
@@ -201,7 +203,9 @@ def read_kb_file(path: str, kb_root: str) -> str:
     return full_path.read_text(encoding="utf-8", errors="replace")
 
 
-def write_kb_file(path: str, content: str, kb_root: str) -> str:
+def write_kb_file(
+    path: str, content: str, kb_root: str, *, assume_locked: bool = False
+) -> str:
     """Write a text file under the KB, restricted to safe write zones.
 
     Allowed prefixes (relative to *kb_root*):
@@ -241,12 +245,15 @@ def write_kb_file(path: str, content: str, kb_root: str) -> str:
             "Access denied: path must be a file under "
             "wiki/explorations/ or output/."
         )
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(content, encoding="utf-8")
+    with maybe_kb_ingest_lock(root, assume_locked=assume_locked):
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
     return f"Written: {path}"
 
 
-def write_wiki_file(path: str, content: str, wiki_root: str) -> str:
+def write_wiki_file(
+    path: str, content: str, wiki_root: str, *, assume_locked: bool = False
+) -> str:
     """Write or overwrite a Markdown file in the wiki.
 
     Parent directories are created automatically if they do not exist.
@@ -263,7 +270,8 @@ def write_wiki_file(path: str, content: str, wiki_root: str) -> str:
     full_path = (root / path).resolve()
     if not full_path.is_relative_to(root):
         return "Access denied: path escapes wiki root."
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(content, encoding="utf-8")
+    kb_dir = root.parent if root.name == "wiki" else None
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
     return f"Written: {path}"
-

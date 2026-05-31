@@ -16,6 +16,7 @@ import re
 import shutil
 from pathlib import Path
 
+from openkb.locks import atomic_write_text, maybe_kb_ingest_lock
 from openkb.skill import (
     extract_description,
     skill_dir as _skill_dir,
@@ -58,28 +59,29 @@ def list_iterations(kb_dir: Path, skill_name: str) -> list[Path]:
     return [p for _, p in iters]
 
 
-def save_iteration(kb_dir: Path, skill_name: str) -> Path | None:
+def save_iteration(kb_dir: Path, skill_name: str, *, assume_locked: bool = False) -> Path | None:
     """Copy current ``<kb>/output/skills/<name>/`` to the next iteration slot.
 
     Returns the saved iteration path, or ``None`` if there's no current
     skill to save (first compile of a new name).
     """
-    src = _skill_dir(kb_dir, skill_name)
-    if not src.is_dir():
-        return None
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        src = _skill_dir(kb_dir, skill_name)
+        if not src.is_dir():
+            return None
 
-    existing = list_iterations(kb_dir, skill_name)
-    next_n = (max((_iter_number(p) for p in existing), default=0) or 0) + 1
+        existing = list_iterations(kb_dir, skill_name)
+        next_n = (max((_iter_number(p) for p in existing), default=0) or 0) + 1
 
-    ws = _workspace_dir(kb_dir, skill_name)
-    ws.mkdir(parents=True, exist_ok=True)
-    dest = ws / f"iteration-{next_n}"
-    shutil.copytree(src, dest)
-    return dest
+        ws = _workspace_dir(kb_dir, skill_name)
+        ws.mkdir(parents=True, exist_ok=True)
+        dest = ws / f"iteration-{next_n}"
+        shutil.copytree(src, dest)
+        return dest
 
 
 def restore_iteration(
-    kb_dir: Path, skill_name: str, n: int | None = None
+    kb_dir: Path, skill_name: str, n: int | None = None, *, assume_locked: bool = False
 ) -> Path:
     """Restore an iteration as the current skill.
 
@@ -88,35 +90,36 @@ def restore_iteration(
 
     Returns the path to the restored skill directory.
     """
-    iters = list_iterations(kb_dir, skill_name)
-    if not iters:
-        raise FileNotFoundError(
-            f"No iterations exist for skill {skill_name!r}."
-        )
-
-    if n is None:
-        src = iters[-1]
-    else:
-        match = next(
-            (p for p in iters if _iter_number(p) == n),
-            None,
-        )
-        if match is None:
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        iters = list_iterations(kb_dir, skill_name)
+        if not iters:
             raise FileNotFoundError(
-                f"Iteration {n} not found for skill {skill_name!r}."
+                f"No iterations exist for skill {skill_name!r}."
             )
-        src = match
 
-    # Save the current state before overwriting it — rollback is a mutation
-    # too, and the workspace promise ("no work is destroyed") has to hold
-    # in both directions. A user who edits files in chat then rolls back
-    # gets those edits preserved as the next iteration, not silently lost.
-    dest = _skill_dir(kb_dir, skill_name)
-    if dest.exists():
-        save_iteration(kb_dir, skill_name)
-        shutil.rmtree(dest)
-    shutil.copytree(src, dest)
-    return dest
+        if n is None:
+            src = iters[-1]
+        else:
+            match = next(
+                (p for p in iters if _iter_number(p) == n),
+                None,
+            )
+            if match is None:
+                raise FileNotFoundError(
+                    f"Iteration {n} not found for skill {skill_name!r}."
+                )
+            src = match
+
+        # Save the current state before overwriting it — rollback is a mutation
+        # too, and the workspace promise ("no work is destroyed") has to hold
+        # in both directions. A user who edits files in chat then rolls back
+        # gets those edits preserved as the next iteration, not silently lost.
+        dest = _skill_dir(kb_dir, skill_name)
+        if dest.exists():
+            save_iteration(kb_dir, skill_name, assume_locked=True)
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+        return dest
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +144,7 @@ def _line_count(path: Path) -> int:
     return len(path.read_text(encoding="utf-8", errors="replace").splitlines())
 
 
-def write_diff(prev: Path, curr: Path, diff_path: Path) -> None:
+def write_diff(prev: Path, curr: Path, diff_path: Path, *, assume_locked: bool = False) -> None:
     """Write a human-readable structural diff from ``prev`` to ``curr``.
 
     Covers:
@@ -193,5 +196,13 @@ def write_diff(prev: Path, curr: Path, diff_path: Path) -> None:
         f"- after:  {curr_lc} lines ({sign}{delta})\n"
     )
 
-    diff_path.parent.mkdir(parents=True, exist_ok=True)
-    diff_path.write_text("\n".join(lines), encoding="utf-8")
+    kb_dir = _kb_dir_for_diff_path(diff_path)
+    with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
+        atomic_write_text(diff_path, "\n".join(lines))
+
+
+def _kb_dir_for_diff_path(diff_path: Path) -> Path | None:
+    for parent in diff_path.resolve().parents:
+        if (parent / ".openkb").is_dir():
+            return parent
+    return None

@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from openkb.locks import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -70,6 +72,28 @@ def resolve_entity_types(config: dict) -> list[str]:
     return cleaned
 
 
+def _atomic_yaml_dump(path: Path, data: dict[str, Any]) -> None:
+    atomic_write_text(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=True))
+
+
+def _with_global_config_lock():
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def _lock():
+        GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = GLOBAL_CONFIG_DIR / "global.lock"
+        with lock_path.open("a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    return _lock()
+
+
 def load_config(config_path: Path) -> dict[str, Any]:
     """Load YAML config from config_path, merged with DEFAULT_CONFIG.
 
@@ -85,9 +109,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def save_config(config_path: Path, config: dict) -> None:
     """Persist config dict to YAML, creating parent directories as needed."""
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with config_path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=True)
+    _atomic_yaml_dump(config_path, config)
 
 
 def load_global_config() -> dict[str, Any]:
@@ -100,18 +122,18 @@ def load_global_config() -> dict[str, Any]:
 
 def save_global_config(config: dict[str, Any]) -> None:
     """Save the global config to ~/.config/openkb/global.yaml."""
-    GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with GLOBAL_CONFIG_PATH.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=True)
+    with _with_global_config_lock():
+        _atomic_yaml_dump(GLOBAL_CONFIG_PATH, config)
 
 
 def register_kb(kb_path: Path) -> None:
     """Register a KB path in the global config's known_kbs list."""
-    gc = load_global_config()
-    known = gc.get("known_kbs", [])
-    resolved = str(kb_path.resolve())
-    if resolved not in known:
-        known.append(resolved)
-        gc["known_kbs"] = known
-    gc["default_kb"] = resolved
-    save_global_config(gc)
+    with _with_global_config_lock():
+        gc = load_global_config()
+        known = gc.get("known_kbs", [])
+        resolved = str(kb_path.resolve())
+        if resolved not in known:
+            known.append(resolved)
+            gc["known_kbs"] = known
+        gc["default_kb"] = resolved
+        _atomic_yaml_dump(GLOBAL_CONFIG_PATH, gc)

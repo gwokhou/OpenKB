@@ -27,6 +27,8 @@ from urllib.parse import unquote, urlparse
 
 import click
 
+from openkb.locks import maybe_kb_ingest_lock
+
 _USER_AGENT = "openkb/url-fetcher (+https://github.com/VectifyAI/OpenKB)"
 _TIMEOUT_SECONDS = 30
 _CHUNK_BYTES = 64 * 1024
@@ -213,7 +215,7 @@ def _extract_html(url: str, raw_dir: Path) -> Path | None:
     return target
 
 
-def fetch_url_to_raw(url: str, kb_dir: Path) -> Path | None:
+def fetch_url_to_raw(url: str, kb_dir: Path, *, assume_locked: bool = False) -> Path | None:
     """Fetch ``url`` into ``<kb>/raw/`` and return the local path.
 
     Routing is decided by HTTP ``Content-Type`` validated against magic
@@ -227,6 +229,10 @@ def fetch_url_to_raw(url: str, kb_dir: Path) -> Path | None:
     existing PageIndex / markitdown routing by file extension and page
     count takes over from there.
     """
+    if not assume_locked:
+        with maybe_kb_ingest_lock(kb_dir):
+            return fetch_url_to_raw(url, kb_dir, assume_locked=True)
+
     raw_dir = kb_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 

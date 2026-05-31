@@ -12,6 +12,8 @@ from typing import Any
 
 from pypdf import PdfReader
 
+from openkb.locks import maybe_kb_ingest_lock
+
 logger = logging.getLogger(__name__)
 
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?!https?://|data:)([^)]+)\)")
@@ -41,9 +43,13 @@ def convert_pdf_to_markdown(
     images_dir: Path,
     output_root: Path,
     backend: str = "hybrid-auto-engine",
+    assume_locked: bool = False,
 ) -> str:
     """Convert a PDF to Markdown using MinerU."""
-    parsed = parse_pdf_with_mineru(pdf_path, doc_name, images_dir, output_root, backend)
+    parsed = parse_pdf_with_mineru(
+        pdf_path, doc_name, images_dir, output_root, backend,
+        assume_locked=assume_locked,
+    )
     return parsed.markdown
 
 
@@ -53,9 +59,13 @@ def convert_pdf_to_pages(
     images_dir: Path,
     output_root: Path,
     backend: str = "hybrid-auto-engine",
+    assume_locked: bool = False,
 ) -> list[dict[str, Any]]:
     """Convert a PDF to OpenKB's per-page JSON source format using MinerU."""
-    parsed = parse_pdf_with_mineru(pdf_path, doc_name, images_dir, output_root, backend)
+    parsed = parse_pdf_with_mineru(
+        pdf_path, doc_name, images_dir, output_root, backend,
+        assume_locked=assume_locked,
+    )
     if parsed.pages:
         return parsed.pages
     return _markdown_to_single_page(parsed.markdown)
@@ -67,8 +77,17 @@ def parse_pdf_with_mineru(
     images_dir: Path,
     output_root: Path,
     backend: str = "hybrid-auto-engine",
+    assume_locked: bool = False,
 ) -> MinerUParsedPdf:
     """Run MinerU and normalize its Markdown, JSON, and image outputs."""
+    kb_dir = _kb_dir_for_mineru_output(output_root)
+    if not assume_locked and kb_dir is not None:
+        with maybe_kb_ingest_lock(kb_dir):
+            return parse_pdf_with_mineru(
+                pdf_path, doc_name, images_dir, output_root, backend,
+                assume_locked=True,
+            )
+
     run_dir = output_root / doc_name
     if run_dir.exists():
         shutil.rmtree(run_dir)
@@ -85,6 +104,16 @@ def parse_pdf_with_mineru(
     markdown = _copy_and_rewrite_markdown_images(markdown, markdown_path.parent, doc_name, images_dir)
     pages = _load_pages(doc_dir, doc_name, images_dir)
     return MinerUParsedPdf(markdown=markdown, pages=pages)
+
+
+def _kb_dir_for_mineru_output(output_root: Path) -> Path | None:
+    """Return KB root for ``<kb>/.openkb/mineru``-style output roots."""
+    output_root = output_root.resolve()
+    if output_root.name == "mineru" and output_root.parent.name == ".openkb":
+        kb_dir = output_root.parent.parent
+        if (kb_dir / ".openkb").is_dir():
+            return kb_dir
+    return None
 
 
 def _run_mineru(pdf_path: Path, output_dir: Path, backend: str) -> None:

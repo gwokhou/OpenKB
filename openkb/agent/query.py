@@ -137,7 +137,7 @@ def build_chat_agent(
                 (e.g. ``"output/skills/demo/SKILL.md"``).
             content: Full text content to write (overwrites if file exists).
         """
-        return write_kb_file(path, content, kb_root)
+        return write_kb_file(path, content, kb_root, assume_locked=True)
 
     extra_tools: list = [write_file]
     skill_instructions_addendum = ""
