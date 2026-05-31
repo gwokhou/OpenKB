@@ -12,7 +12,10 @@ import json
 import logging
 import shutil
 import sys
+import threading  # noqa: E402
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 from pathlib import Path
 from typing import Literal
 
@@ -149,6 +152,8 @@ _TYPE_DISPLAY_MAP = {
 
 _SHORT_DOC_TYPES = {"pdf", "docx", "md", "markdown", "html", "htm", "txt", "csv", "pptx", "xlsx", "xls"}
 
+_AddOutcome = Literal["added", "skipped", "failed"]
+
 
 def _display_type(raw_type: str) -> str:
     """Map a raw stored doc type to a display type string."""
@@ -259,50 +264,81 @@ def _clear_existing_skill_dir(kb_dir: Path, name: str) -> None:
         shutil.rmtree(target)
 
 
-def add_single_file(file_path: Path, kb_dir: Path) -> Literal["added", "skipped", "failed"]:
-    """Convert, index, and compile a single document into the knowledge base.
+@dataclass
+class _PreparedAdd:
+    """Result of the per-file producer stage for `openkb add`."""
 
-    Steps:
-    1. Load config to get the model name.
-    2. Convert the document (hash-check; skip if already known).
-    3. If long doc: run PageIndex then compile_long_doc.
-    4. Else: compile_short_doc.
+    file_path: Path
+    result: object | None = None
+    outcome: _AddOutcome | None = None
+    error_stage: str = ""
+    error: Exception | None = None
 
-    Returns:
-        ``"added"`` on full success, ``"skipped"`` when the file's hash
-        is already in the registry (dedup), or ``"failed"`` when any
-        pipeline stage raised. URL-ingest distinguishes these so it can
-        unlink the just-downloaded raw file on dedup (it would otherwise
-        be an orphan) while preserving it on failure so the user can
-        retry without re-downloading.
-    """
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, parsed)
+
+
+def _non_negative_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _prepare_add_file(file_path: Path, kb_dir: Path) -> _PreparedAdd:
+    """Run the file-local producer stage: conversion, extraction, dedup."""
+    logger = logging.getLogger(__name__)
+    try:
+        result = convert_document(file_path, kb_dir)
+    except Exception as exc:
+        logger.debug("Conversion traceback:", exc_info=True)
+        return _PreparedAdd(
+            file_path=file_path,
+            outcome="failed",
+            error_stage="Conversion",
+            error=exc,
+        )
+
+    if result.skipped:
+        return _PreparedAdd(file_path=file_path, outcome="skipped", result=result)
+    return _PreparedAdd(file_path=file_path, result=result)
+
+
+def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _AddOutcome:
+    """Run the serialized consumer stage: compile wiki, register hash, log."""
     from openkb.agent.compiler import compile_long_doc, compile_short_doc
     from openkb.state import HashRegistry
 
     logger = logging.getLogger(__name__)
-    openkb_dir = kb_dir / ".openkb"
-    config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
-    model: str = config.get("model", DEFAULT_CONFIG["model"])
-    registry = HashRegistry(openkb_dir / "hashes.json")
+    file_path = prepared.file_path
 
-    # 2. Convert document
-    click.echo(f"Adding: {file_path.name}")
-    try:
-        result = convert_document(file_path, kb_dir)
-    except Exception as exc:
-        click.echo(f"  [ERROR] Conversion failed: {exc}")
-        logger.debug("Conversion traceback:", exc_info=True)
+    if prepared.outcome == "failed":
+        click.echo(f"  [ERROR] {prepared.error_stage} failed: {prepared.error}")
+        return "failed"
+    if prepared.outcome == "skipped":
+        click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
+        return "skipped"
+
+    result = prepared.result
+    if result is None:
+        click.echo(f"  [ERROR] Conversion failed: no result for {file_path.name}")
         return "failed"
 
-    if result.skipped:
+    openkb_dir = kb_dir / ".openkb"
+    registry = HashRegistry(openkb_dir / "hashes.json")
+    if result.file_hash and registry.is_known(result.file_hash):
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
         return "skipped"
 
     doc_name = file_path.stem
-    index_result = None  # populated only on the long-doc branch
+    index_result = None
 
-    # 3/4. Index and compile
     if result.is_long_doc:
         click.echo(f"  Long document detected — indexing with PageIndex...")
         try:
@@ -318,8 +354,14 @@ def add_single_file(file_path: Path, kb_dir: Path) -> Literal["added", "skipped"
         for attempt in range(2):
             try:
                 asyncio.run(
-                    compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
-                                     doc_description=index_result.description)
+                    compile_long_doc(
+                        doc_name,
+                        summary_path,
+                        index_result.doc_id,
+                        kb_dir,
+                        model,
+                        doc_description=index_result.description,
+                    )
                 )
                 break
             except Exception as exc:
@@ -345,7 +387,6 @@ def add_single_file(file_path: Path, kb_dir: Path) -> Literal["added", "skipped"
                     logger.debug("Compilation traceback:", exc_info=True)
                     return "failed"
 
-    # Register hash only after successful compilation
     if result.file_hash:
         doc_type = "long_pdf" if result.is_long_doc else file_path.suffix.lstrip(".")
         meta = {
@@ -353,9 +394,6 @@ def add_single_file(file_path: Path, kb_dir: Path) -> Literal["added", "skipped"
             "doc_name": doc_name,
             "type": doc_type,
         }
-        # For long PDFs we also persist the PageIndex doc_id so `openkb
-        # remove` can later call ``Collection.delete_document(doc_id)``
-        # to free the managed PDF copy + SQLite row.
         if index_result is not None:
             meta["doc_id"] = index_result.doc_id
         registry.add(result.file_hash, meta)
@@ -363,6 +401,119 @@ def add_single_file(file_path: Path, kb_dir: Path) -> Literal["added", "skipped"
     append_log(kb_dir / "wiki", "ingest", file_path.name)
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
     return "added"
+
+
+def add_single_file(file_path: Path, kb_dir: Path) -> _AddOutcome:
+    """Convert, index, and compile a single document into the knowledge base.
+
+    Steps:
+    1. Load config to get the model name.
+    2. Convert the document (hash-check; skip if already known).
+    3. If long doc: run PageIndex then compile_long_doc.
+    4. Else: compile_short_doc.
+
+    Returns:
+        ``"added"`` on full success, ``"skipped"`` when the file's hash
+        is already in the registry (dedup), or ``"failed"`` when any
+        pipeline stage raised. URL-ingest distinguishes these so it can
+        unlink the just-downloaded raw file on dedup (it would otherwise
+        be an orphan) while preserving it on failure so the user can
+        retry without re-downloading.
+    """
+    openkb_dir = kb_dir / ".openkb"
+    config = load_config(openkb_dir / "config.yaml")
+    _setup_llm_key(kb_dir)
+    model: str = config.get("model", DEFAULT_CONFIG["model"])
+    click.echo(f"Adding: {file_path.name}")
+    return _commit_prepared_add(_prepare_add_file(file_path, kb_dir), kb_dir, model)
+
+
+def _add_files_batch(
+    files: list[Path],
+    kb_dir: Path,
+    *,
+    jobs: int | None = None,
+    buffer_size: int | None = None,
+) -> dict[_AddOutcome, int]:
+    """Process many files with bounded producer concurrency and serial commits."""
+    from openkb.state import HashRegistry
+
+    openkb_dir = kb_dir / ".openkb"
+    config = load_config(openkb_dir / "config.yaml")
+    _setup_llm_key(kb_dir)
+    model: str = config.get("model", DEFAULT_CONFIG["model"])
+    worker_count = _positive_int(jobs if jobs is not None else config.get("file_processing_jobs"), 2)
+    queued_buffer = _non_negative_int(
+        buffer_size if buffer_size is not None else config.get("pipeline_buffer_size"),
+        2,
+    )
+    max_pending = max(1, worker_count + queued_buffer)
+
+    counts: dict[_AddOutcome, int] = {"added": 0, "skipped": 0, "failed": 0}
+    registry = HashRegistry(openkb_dir / "hashes.json")
+    seen_hashes: set[str] = set()
+    seen_doc_names: dict[str, Path] = {}
+    pending_files: list[Path] = []
+
+    for file_path in files:
+        doc_name = file_path.stem
+        if doc_name in seen_doc_names:
+            click.echo(f"\nAdding: {file_path.name}")
+            click.echo(
+                "  [ERROR] Document name conflict: "
+                f"{file_path} and {seen_doc_names[doc_name]} both compile to "
+                f"doc_name '{doc_name}'. Rename one file before adding."
+            )
+            counts["failed"] += 1
+            continue
+        try:
+            file_hash = HashRegistry.hash_file(file_path)
+        except Exception as exc:
+            click.echo(f"\nAdding: {file_path.name}")
+            click.echo(f"  [ERROR] Hash failed: {exc}")
+            counts["failed"] += 1
+            continue
+        if file_hash in seen_hashes or registry.is_known(file_hash):
+            click.echo(f"\nAdding: {file_path.name}")
+            click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
+            counts["skipped"] += 1
+            continue
+        seen_hashes.add(file_hash)
+        seen_doc_names[doc_name] = file_path
+        pending_files.append(file_path)
+
+    def _drain(done: set[Future[_PreparedAdd]]) -> None:
+        for future in done:
+            try:
+                prepared = future.result()
+            except Exception as exc:
+                click.echo("\nAdding: <unknown>")
+                click.echo(f"  [ERROR] Conversion failed: {exc}")
+                counts["failed"] += 1
+                continue
+            click.echo(f"\nAdding: {prepared.file_path.name}")
+            outcome = _commit_prepared_add(prepared, kb_dir, model)
+            counts[outcome] += 1
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        pending: set[Future[_PreparedAdd]] = set()
+        iterator = iter(pending_files)
+
+        while True:
+            while len(pending) < max_pending:
+                try:
+                    file_path = next(iterator)
+                except StopIteration:
+                    break
+                pending.add(executor.submit(_prepare_add_file, file_path, kb_dir))
+
+            if not pending:
+                break
+
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            _drain(done)
+
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +702,10 @@ def init(model, language):
         "model": model,
         "language": language,
         "pageindex_threshold": DEFAULT_CONFIG["pageindex_threshold"],
+        "mineru_backend": DEFAULT_CONFIG["mineru_backend"],
+        "mineru_output_dir": DEFAULT_CONFIG["mineru_output_dir"],
+        "file_processing_jobs": DEFAULT_CONFIG["file_processing_jobs"],
+        "pipeline_buffer_size": DEFAULT_CONFIG["pipeline_buffer_size"],
     }
     save_config(openkb_dir / "config.yaml", config)
     (openkb_dir / "hashes.json").write_text(json.dumps({}), encoding="utf-8")
@@ -572,9 +727,21 @@ def init(model, language):
 
 
 @cli.command()
+@click.option(
+    "--jobs",
+    type=int,
+    default=None,
+    help="Number of files to convert/parse concurrently. Defaults to config.",
+)
+@click.option(
+    "--buffer-size",
+    type=int,
+    default=None,
+    help="Number of converted files allowed to wait for serial wiki compilation.",
+)
 @click.argument("path")
 @click.pass_context
-def add(ctx, path):
+def add(ctx, path, jobs, buffer_size):
     """Add a document or directory of documents at PATH to the knowledge base.
 
     PATH may be a local file, a local directory (which is walked
@@ -622,9 +789,12 @@ def add(ctx, path):
             return
         total = len(files)
         click.echo(f"Found {total} supported file(s) in {path}.")
-        for i, f in enumerate(files, 1):
-            click.echo(f"\n[{i}/{total}] ", nl=False)
-            add_single_file(f, kb_dir)
+        effective_jobs = _positive_int(
+            jobs if jobs is not None else load_config(kb_dir / ".openkb" / "config.yaml").get("file_processing_jobs"),
+            2,
+        )
+        click.echo(f"Processing with {effective_jobs} worker(s).")
+        _add_files_batch(files, kb_dir, jobs=jobs, buffer_size=buffer_size)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             click.echo(
@@ -1328,8 +1498,20 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
 
 
 @cli.command()
+@click.option(
+    "--jobs",
+    type=int,
+    default=None,
+    help="Number of files to convert/parse concurrently. Defaults to config.",
+)
+@click.option(
+    "--buffer-size",
+    type=int,
+    default=None,
+    help="Number of converted files allowed to wait for serial wiki compilation.",
+)
 @click.pass_context
-def watch(ctx):
+def watch(ctx, jobs, buffer_size):
     """Watch the raw/ directory for new documents and process them automatically."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
@@ -1340,8 +1522,10 @@ def watch(ctx):
 
     raw_dir = kb_dir / "raw"
     raw_dir.mkdir(exist_ok=True)
+    batch_lock = threading.Lock()
 
     def on_new_files(paths):
+        files = []
         for p in paths:
             fp = Path(p)
             if fp.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -1350,7 +1534,10 @@ def watch(ctx):
                     f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
                 )
                 continue
-            add_single_file(fp, kb_dir)
+            files.append(fp)
+        if files:
+            with batch_lock:
+                _add_files_batch(files, kb_dir, jobs=jobs, buffer_size=buffer_size)
 
     click.echo(f"Watching {raw_dir} for new documents. Press Ctrl+C to stop.")
     watch_directory(raw_dir, on_new_files)

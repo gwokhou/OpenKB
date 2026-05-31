@@ -5,12 +5,20 @@ def test_default_config_keys():
     assert "model" in DEFAULT_CONFIG
     assert "language" in DEFAULT_CONFIG
     assert "pageindex_threshold" in DEFAULT_CONFIG
+    assert "mineru_backend" in DEFAULT_CONFIG
+    assert "mineru_output_dir" in DEFAULT_CONFIG
+    assert "file_processing_jobs" in DEFAULT_CONFIG
+    assert "pipeline_buffer_size" in DEFAULT_CONFIG
 
 
 def test_default_config_values():
     assert DEFAULT_CONFIG["model"] == "gpt-5.4-mini"
     assert DEFAULT_CONFIG["language"] == "en"
     assert DEFAULT_CONFIG["pageindex_threshold"] == 20
+    assert DEFAULT_CONFIG["mineru_backend"] == "hybrid-auto-engine"
+    assert DEFAULT_CONFIG["mineru_output_dir"] == ".openkb/mineru"
+    assert DEFAULT_CONFIG["file_processing_jobs"] == 2
+    assert DEFAULT_CONFIG["pipeline_buffer_size"] == 2
 
 
 def test_load_missing_file_returns_defaults(tmp_path):
@@ -35,6 +43,9 @@ def test_save_load_roundtrip(tmp_path):
     assert loaded["language"] == "fr"
     # Defaults fill in missing keys
     assert loaded["pageindex_threshold"] == DEFAULT_CONFIG["pageindex_threshold"]
+    assert loaded["mineru_backend"] == DEFAULT_CONFIG["mineru_backend"]
+    assert loaded["file_processing_jobs"] == DEFAULT_CONFIG["file_processing_jobs"]
+    assert loaded["pipeline_buffer_size"] == DEFAULT_CONFIG["pipeline_buffer_size"]
 
 
 def test_load_overrides_defaults(tmp_path):
@@ -45,3 +56,4 @@ def test_load_overrides_defaults(tmp_path):
     assert loaded["pageindex_threshold"] == 100
     # Non-overridden defaults still present
     assert loaded["language"] == "en"
+    assert loaded["mineru_backend"] == "hybrid-auto-engine"

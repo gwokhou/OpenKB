@@ -6,11 +6,11 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-import pymupdf
 from markitdown import MarkItDown
 
 from openkb.config import load_config
-from openkb.images import copy_relative_images, extract_base64_images, convert_pdf_with_images
+from openkb.images import copy_relative_images, extract_base64_images
+from openkb.pdf_parser import convert_pdf_to_markdown, get_pdf_page_count, parse_pdf_with_mineru
 from openkb.state import HashRegistry
 
 logger = logging.getLogger(__name__)
@@ -25,12 +25,6 @@ class ConvertResult:
     is_long_doc: bool = False
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
-
-
-def get_pdf_page_count(path: Path) -> int:
-    """Return the number of pages in the PDF at *path* using pymupdf."""
-    with pymupdf.open(str(path)) as doc:
-        return doc.page_count
 
 
 def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
@@ -50,6 +44,8 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
     threshold: int = config.get("pageindex_threshold", 20)
+    mineru_backend: str = config.get("mineru_backend", "hybrid-auto-engine")
+    mineru_output_dir = kb_dir / config.get("mineru_output_dir", ".openkb/mineru")
     registry = HashRegistry(openkb_dir / "hashes.json")
 
     # ------------------------------------------------------------------
@@ -72,12 +68,16 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
     # ------------------------------------------------------------------
     # 3. PDF long-doc detection
     # ------------------------------------------------------------------
+    pdf_page_count: int | None = None
     if src.suffix.lower() == ".pdf":
-        page_count = get_pdf_page_count(src)
-        if page_count >= threshold:
+        try:
+            pdf_page_count = get_pdf_page_count(src)
+        except Exception as exc:
+            logger.warning("Could not read PDF page count before MinerU parse for %s: %s", src.name, exc)
+        if pdf_page_count is not None and pdf_page_count >= threshold:
             logger.info(
                 "Long PDF detected (%d pages >= %d threshold): %s",
-                page_count,
+                pdf_page_count,
                 threshold,
                 src.name,
             )
@@ -97,8 +97,26 @@ def convert_document(src: Path, kb_dir: Path) -> ConvertResult:
         markdown = src.read_text(encoding="utf-8")
         markdown = copy_relative_images(markdown, src.parent, doc_name, images_dir)
     elif src.suffix.lower() == ".pdf":
-        # Use pymupdf dict-mode for PDFs: text + images inline at correct positions
-        markdown = convert_pdf_with_images(src, doc_name, images_dir)
+        if pdf_page_count is None:
+            parsed = parse_pdf_with_mineru(src, doc_name, images_dir, mineru_output_dir, mineru_backend)
+            inferred_page_count = len(parsed.pages)
+            if inferred_page_count >= threshold:
+                logger.info(
+                    "Long PDF detected from MinerU output (%d pages >= %d threshold): %s",
+                    inferred_page_count,
+                    threshold,
+                    src.name,
+                )
+                return ConvertResult(raw_path=raw_dest, is_long_doc=True, file_hash=file_hash)
+            markdown = parsed.markdown
+        else:
+            markdown = convert_pdf_to_markdown(
+                src,
+                doc_name,
+                images_dir,
+                mineru_output_dir,
+                mineru_backend,
+            )
     else:
         # Non-PDF, non-MD: use markitdown (docx, pptx, html, etc.)
         mid = MarkItDown()

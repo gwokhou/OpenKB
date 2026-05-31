@@ -82,6 +82,8 @@ def test_init_defaults_language_to_en(tmp_path):
         from pathlib import Path
         config = yaml.safe_load((Path(".openkb") / "config.yaml").read_text())
         assert config["language"] == "en"
+        assert config["file_processing_jobs"] == 2
+        assert config["pipeline_buffer_size"] == 2
 
 
 def test_init_empty_language_flag_falls_back_to_default(tmp_path):

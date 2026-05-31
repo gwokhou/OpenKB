@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -321,9 +322,28 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
     return "\n".join(parts)
 
 
+def _debug_llm_payloads() -> bool:
+    return os.environ.get("OPENKB_DEBUG_LLM", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _message_lengths(messages: list[dict]) -> str:
+    parts = []
+    for msg in messages:
+        raw = msg["content"]
+        if isinstance(raw, list):
+            text = "".join(b.get("text", "") for b in raw if isinstance(b, dict))
+        else:
+            text = raw
+        parts.append(f"{msg['role']}={len(text)}")
+    return ", ".join(parts)
+
+
 def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
     """Single LLM call with animated progress and debug logging."""
-    logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
+    if _debug_llm_payloads():
+        logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
+    else:
+        logger.debug("LLM request [%s]: message_lengths=%s", step_name, _message_lengths(messages))
     if kwargs:
         logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
 
@@ -336,13 +356,19 @@ def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str
     _warn_if_truncated(response, step_name, kwargs.get("max_tokens"))
 
     spinner.stop(_format_usage(time.time() - t0, response.usage))
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    if _debug_llm_payloads():
+        logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    else:
+        logger.debug("LLM response [%s]: chars=%d", step_name, len(content))
     return content.strip()
 
 
 async def _llm_call_async(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
     """Async LLM call with timing output and debug logging."""
-    logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
+    if _debug_llm_payloads():
+        logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
+    else:
+        logger.debug("LLM request [%s]: message_lengths=%s", step_name, _message_lengths(messages))
     if kwargs:
         logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
 
@@ -355,7 +381,10 @@ async def _llm_call_async(model: str, messages: list[dict], step_name: str, **kw
     elapsed = time.time() - t0
     sys.stdout.write(f"    {step_name}... {_format_usage(elapsed, response.usage)}\n")
     sys.stdout.flush()
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    if _debug_llm_payloads():
+        logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
+    else:
+        logger.debug("LLM response [%s]: chars=%d", step_name, len(content))
     return content.strip()
 
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -72,7 +74,7 @@ class TestAddCommand:
             runner.invoke(cli, ["add", str(doc)])
             mock_add.assert_called_once_with(doc, kb_dir)
 
-    def test_add_directory_calls_helper_for_each_file(self, tmp_path):
+    def test_add_directory_uses_batch_runner_for_supported_files(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
         docs_dir = tmp_path / "docs"
         docs_dir.mkdir()
@@ -81,15 +83,31 @@ class TestAddCommand:
         (docs_dir / "ignore.xyz").write_text("skip me")
 
         runner = CliRunner()
-        with patch("openkb.cli.add_single_file") as mock_add, \
+        with patch("openkb.cli._add_files_batch") as mock_batch, \
              patch("openkb.cli._find_kb_dir", return_value=kb_dir):
-            runner.invoke(cli, ["add", str(docs_dir)])
-            # Should be called for .md and .txt but not .xyz
-            assert mock_add.call_count == 2
-            called_names = {call.args[0].name for call in mock_add.call_args_list}
-            assert "a.md" in called_names
-            assert "b.txt" in called_names
-            assert "ignore.xyz" not in called_names
+            runner.invoke(cli, ["add", str(docs_dir), "--jobs", "3", "--buffer-size", "4"])
+            mock_batch.assert_called_once()
+            files = mock_batch.call_args.args[0]
+            assert [p.name for p in files] == ["a.md", "b.txt"]
+            assert mock_batch.call_args.kwargs["jobs"] == 3
+            assert mock_batch.call_args.kwargs["buffer_size"] == 4
+
+    def test_add_directory_uses_configured_jobs_when_option_omitted(self, tmp_path):
+        kb_dir = self._setup_kb(tmp_path)
+        (kb_dir / ".openkb" / "config.yaml").write_text(
+            "model: gpt-4o-mini\nfile_processing_jobs: 7\n"
+        )
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "a.md").write_text("# A")
+
+        runner = CliRunner()
+        with patch("openkb.cli._add_files_batch") as mock_batch, \
+             patch("openkb.cli._find_kb_dir", return_value=kb_dir):
+            result = runner.invoke(cli, ["add", str(docs_dir)])
+
+        assert "Processing with 7 worker(s)." in result.output
+        assert mock_batch.call_args.kwargs["jobs"] is None
 
     def test_add_unsupported_extension(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
@@ -147,3 +165,185 @@ class TestAddCommand:
             result = runner.invoke(cli, ["add", str(doc)])
             mock_arun.assert_called_once()
             assert "OK" in result.output
+
+
+class TestAddBatchRunner:
+    def _setup_kb(self, tmp_path):
+        (tmp_path / "raw").mkdir()
+        (tmp_path / "wiki" / "sources").mkdir(parents=True)
+        (tmp_path / "wiki" / "summaries").mkdir(parents=True)
+        (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+        (tmp_path / "wiki" / "log.md").write_text("# Operations Log\n\n")
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "config.yaml").write_text(
+            "model: gpt-4o-mini\nfile_processing_jobs: 2\npipeline_buffer_size: 1\n"
+        )
+        (openkb_dir / "hashes.json").write_text(json.dumps({}))
+        return tmp_path
+
+    def test_batch_runner_compiles_and_registers_each_file(self, tmp_path):
+        from openkb.cli import _add_files_batch
+        from openkb.converter import ConvertResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc_a = tmp_path / "a.md"
+        doc_b = tmp_path / "b.md"
+        doc_a.write_text("# A")
+        doc_b.write_text("# B")
+        source_a = kb_dir / "wiki" / "sources" / "a.md"
+        source_b = kb_dir / "wiki" / "sources" / "b.md"
+        source_a.write_text("# A converted")
+        source_b.write_text("# B converted")
+
+        def convert_side_effect(path, _kb_dir):
+            return ConvertResult(
+                raw_path=kb_dir / "raw" / path.name,
+                source_path=source_a if path.name == "a.md" else source_b,
+                is_long_doc=False,
+                file_hash=("a" if path.name == "a.md" else "b") * 64,
+            )
+
+        async def fake_compile(*_args, **_kwargs):
+            return None
+
+        with patch("openkb.cli.convert_document", side_effect=convert_side_effect), \
+             patch("openkb.agent.compiler.compile_short_doc", side_effect=fake_compile) as mock_compile:
+            counts = _add_files_batch([doc_a, doc_b], kb_dir, jobs=2, buffer_size=1)
+
+        assert counts == {"added": 2, "skipped": 0, "failed": 0}
+        assert mock_compile.call_count == 2
+        hashes = json.loads((kb_dir / ".openkb" / "hashes.json").read_text())
+        assert {meta["name"] for meta in hashes.values()} == {"a.md", "b.md"}
+
+    def test_batch_runner_skips_duplicate_hash_within_batch(self, tmp_path):
+        from openkb.cli import _add_files_batch
+        from openkb.converter import ConvertResult
+        from openkb.state import HashRegistry
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc_a = tmp_path / "a.md"
+        doc_b = tmp_path / "b.md"
+        doc_a.write_text("same")
+        doc_b.write_text("same")
+        source_a = kb_dir / "wiki" / "sources" / "a.md"
+        source_a.write_text("# A converted")
+        digest = HashRegistry.hash_file(doc_a)
+        converted = ConvertResult(
+            raw_path=kb_dir / "raw" / "a.md",
+            source_path=source_a,
+            is_long_doc=False,
+            file_hash=digest,
+        )
+
+        async def fake_compile(*_args, **_kwargs):
+            return None
+
+        with patch("openkb.cli.convert_document", return_value=converted) as mock_convert, \
+             patch("openkb.agent.compiler.compile_short_doc", side_effect=fake_compile):
+            counts = _add_files_batch([doc_a, doc_b], kb_dir, jobs=2, buffer_size=1)
+
+        assert counts == {"added": 1, "skipped": 1, "failed": 0}
+        mock_convert.assert_called_once()
+
+    def test_batch_runner_rejects_doc_name_conflict_before_conversion(self, tmp_path):
+        from openkb.cli import _add_files_batch
+        from openkb.converter import ConvertResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        doc_a = dir_a / "paper.md"
+        doc_b = dir_b / "paper.md"
+        doc_a.write_text("# A")
+        doc_b.write_text("# B")
+        source_a = kb_dir / "wiki" / "sources" / "paper.md"
+        source_a.write_text("# A converted")
+        converted = ConvertResult(
+            raw_path=kb_dir / "raw" / "paper.md",
+            source_path=source_a,
+            is_long_doc=False,
+            file_hash="a" * 64,
+        )
+
+        async def fake_compile(*_args, **_kwargs):
+            return None
+
+        with patch("openkb.cli.convert_document", return_value=converted) as mock_convert, \
+             patch("openkb.agent.compiler.compile_short_doc", side_effect=fake_compile):
+            counts = _add_files_batch([doc_a, doc_b], kb_dir, jobs=2, buffer_size=1)
+
+        assert counts == {"added": 1, "skipped": 0, "failed": 1}
+        mock_convert.assert_called_once_with(doc_a, kb_dir)
+
+
+class TestWatchCommand:
+    def test_watch_uses_batch_runner_for_debounced_supported_files(self, tmp_path):
+        kb_dir = TestAddCommand()._setup_kb(tmp_path)
+        raw_dir = kb_dir / "raw"
+        doc = raw_dir / "a.md"
+        skip = raw_dir / "a.xyz"
+        doc.write_text("# A")
+        skip.write_text("skip")
+
+        def fake_watch(_raw_dir, callback):
+            callback([str(doc), str(skip)])
+
+        runner = CliRunner()
+        with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
+             patch("openkb.watcher.watch_directory", side_effect=fake_watch), \
+             patch("openkb.cli._add_files_batch") as mock_batch:
+            result = runner.invoke(cli, ["watch", "--jobs", "5", "--buffer-size", "6"])
+
+        assert result.exit_code == 0, result.output
+        assert "Skipping unsupported file type" in result.output
+        mock_batch.assert_called_once()
+        assert [p.name for p in mock_batch.call_args.args[0]] == ["a.md"]
+        assert mock_batch.call_args.kwargs["jobs"] == 5
+        assert mock_batch.call_args.kwargs["buffer_size"] == 6
+
+    def test_watch_serializes_overlapping_debounced_batches(self, tmp_path):
+        kb_dir = TestAddCommand()._setup_kb(tmp_path)
+        raw_dir = kb_dir / "raw"
+        doc_a = raw_dir / "a.md"
+        doc_b = raw_dir / "b.md"
+        doc_a.write_text("# A")
+        doc_b.write_text("# B")
+
+        callbacks = []
+
+        def fake_watch(_raw_dir, callback):
+            callbacks.append(callback)
+
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def fake_batch(*_args, **_kwargs):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with active_lock:
+                active -= 1
+
+        runner = CliRunner()
+        with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
+             patch("openkb.watcher.watch_directory", side_effect=fake_watch), \
+             patch("openkb.cli._add_files_batch", side_effect=fake_batch):
+            result = runner.invoke(cli, ["watch"])
+
+            assert result.exit_code == 0, result.output
+            assert callbacks
+
+            t1 = threading.Thread(target=callbacks[0], args=([str(doc_a)],))
+            t2 = threading.Thread(target=callbacks[0], args=([str(doc_b)],))
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+
+        assert max_active == 1

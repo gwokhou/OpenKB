@@ -1,6 +1,10 @@
 model: gpt-5.4                   # LLM model (any LiteLLM-supported provider)
 language: en                     # Wiki output language
 pageindex_threshold: 20          # PDF pages threshold for PageIndex
+mineru_backend: hybrid-auto-engine # MinerU local GPU-capable backend
+mineru_output_dir: .openkb/mineru # Cached MinerU parse artifacts
+file_processing_jobs: 2            # Concurrent file conversion/PDF parsing workers
+pipeline_buffer_size: 2            # Converted files buffered before wiki compilation
 
 # Optional: override the entity-type vocabulary used for entity pages.
 # Omit this key to use the default 7 types

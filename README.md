@@ -125,8 +125,8 @@ wiki/                                  │            ← the foundation
 
 | | Short documents | Long documents (PDF ≥ 20 pages) |
 |---|---|---|
-| **Convert** | markitdown → Markdown | PageIndex → tree index + summaries |
-| **Images** | Extracted inline (pymupdf) | Extracted by PageIndex |
+| **Convert** | MinerU / markitdown → Markdown | PageIndex → tree index + summaries |
+| **Images** | Extracted inline (MinerU) | PageIndex Cloud or MinerU fallback |
 | **LLM reads** | Full text | Document trees |
 | **Result** | summary + concepts | summary + concepts |
 
@@ -269,6 +269,10 @@ Settings are initialized by `openkb init`, and stored in `.openkb/config.yaml`:
 model: gpt-5.4                   # LLM model (any LiteLLM-supported provider)
 language: en                     # Wiki output language
 pageindex_threshold: 20          # PDF pages threshold for PageIndex
+mineru_backend: hybrid-auto-engine # MinerU local GPU-capable backend
+mineru_output_dir: .openkb/mineru # Cached MinerU parse artifacts
+file_processing_jobs: 2          # Concurrent file conversion/PDF parsing workers
+pipeline_buffer_size: 2          # Converted files buffered before wiki compilation
 ```
 
 `entity_types` (optional): a YAML list overriding the entity-type vocabulary used for entity pages; omit it to use the default `person`, `organization`, `place`, `product`, `work`, `event`, `other`.
@@ -287,6 +291,8 @@ Long documents are challenging for LLMs due to context limits, context rot, and 
 [PageIndex](https://github.com/VectifyAI/PageIndex) solves this with vectorless, reasoning-based retrieval — building a hierarchical tree index that lets LLMs reason over the index for context-aware retrieval.
 
 PageIndex runs locally by default using the [open-source version](https://github.com/VectifyAI/PageIndex), with no external dependencies required.
+
+PDF source extraction is handled by [MinerU](https://opendatalab.github.io/MinerU/) so OpenKB can preserve reading order, tables, formulas, images, and OCR output before compiling wiki pages. The default `hybrid-auto-engine` backend uses local computing power and can use the local GPU when the MinerU runtime detects one. Long PDFs still use PageIndex for tree indexing and summaries; if PageIndex Cloud does not return page content, OpenKB falls back to MinerU for `wiki/sources/<doc>.json`.
 
 #### Optional: Cloud Support
 

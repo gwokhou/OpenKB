@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 
 from openkb.converter import convert_document, get_pdf_page_count
+from openkb.pdf_parser import MinerUParsedPdf
 
 
 # ---------------------------------------------------------------------------
@@ -14,12 +15,10 @@ from openkb.converter import convert_document, get_pdf_page_count
 
 class TestGetPdfPageCount:
     def test_returns_page_count(self, tmp_path):
-        """Mock pymupdf to return a doc with 5 pages."""
-        fake_doc = MagicMock()
-        fake_doc.page_count = 5
-        fake_doc.__enter__ = MagicMock(return_value=fake_doc)
-        fake_doc.__exit__ = MagicMock(return_value=False)
-        with patch("openkb.converter.pymupdf.open", return_value=fake_doc):
+        """Mock pypdf to return a doc with 5 pages."""
+        fake_reader = MagicMock()
+        fake_reader.pages = [object()] * 5
+        with patch("openkb.pdf_parser.PdfReader", return_value=fake_reader):
             count = get_pdf_page_count(tmp_path / "fake.pdf")
         assert count == 5
 
@@ -78,28 +77,43 @@ class TestConvertDocumentMarkdown:
 
 
 class TestConvertDocumentPdfShort:
-    def test_short_pdf_converted_via_pymupdf(self, kb_dir, tmp_path):
-        """PDF under threshold is converted with pymupdf (convert_pdf_with_images)."""
+    def test_short_pdf_converted_via_mineru(self, kb_dir, tmp_path):
+        """PDF under threshold is converted with MinerU."""
         src = tmp_path / "short.pdf"
         src.write_bytes(b"%PDF-1.4 fake content")
 
         with (
-            patch("openkb.converter.pymupdf.open") as mock_mu,
-            patch("openkb.converter.convert_pdf_with_images", return_value="# Short PDF\n\nConverted.") as mock_cpwi,
+            patch("openkb.converter.get_pdf_page_count", return_value=5),
+            patch("openkb.converter.convert_pdf_to_markdown", return_value="# Short PDF\n\nConverted.") as mock_convert,
         ):
-            fake_doc = MagicMock()
-            fake_doc.page_count = 5  # below default threshold of 20
-            fake_doc.__enter__ = MagicMock(return_value=fake_doc)
-            fake_doc.__exit__ = MagicMock(return_value=False)
-            mock_mu.return_value = fake_doc
-
             result = convert_document(src, kb_dir)
 
-        mock_cpwi.assert_called_once()
+        mock_convert.assert_called_once()
         assert result.skipped is False
         assert result.is_long_doc is False
         assert result.source_path is not None
         assert result.source_path.exists()
+
+    def test_page_count_failure_uses_mineru_output_for_short_pdf(self, kb_dir, tmp_path):
+        """If PDF metadata page count fails, MinerU output still drives conversion."""
+        src = tmp_path / "short.pdf"
+        src.write_bytes(b"%PDF-1.4 fake content")
+
+        parsed = MinerUParsedPdf(
+            markdown="# Short PDF\n\nConverted.",
+            pages=[{"page": 1, "content": "Converted.", "images": []}],
+        )
+
+        with (
+            patch("openkb.converter.get_pdf_page_count", side_effect=ValueError("bad pdf")),
+            patch("openkb.converter.parse_pdf_with_mineru", return_value=parsed) as mock_parse,
+        ):
+            result = convert_document(src, kb_dir)
+
+        mock_parse.assert_called_once()
+        assert result.is_long_doc is False
+        assert result.source_path is not None
+        assert result.source_path.read_text(encoding="utf-8").startswith("# Short PDF")
 
 
 # ---------------------------------------------------------------------------
@@ -114,17 +128,31 @@ class TestConvertDocumentPdfLong:
         src.write_bytes(b"%PDF-1.4 fake long content")
 
         with (
-            patch("openkb.converter.pymupdf.open") as mock_mu,
+            patch("openkb.converter.get_pdf_page_count", return_value=200),
         ):
-            fake_doc = MagicMock()
-            fake_doc.page_count = 200  # above threshold
-            fake_doc.__enter__ = MagicMock(return_value=fake_doc)
-            fake_doc.__exit__ = MagicMock(return_value=False)
-            mock_mu.return_value = fake_doc
-
             result = convert_document(src, kb_dir)
 
         assert result.is_long_doc is True
         assert result.source_path is None
         assert result.skipped is False
+        assert result.raw_path is not None
+
+    def test_page_count_failure_uses_mineru_output_for_long_pdf(self, kb_dir, tmp_path):
+        """MinerU page output can still route a PDF to PageIndex when page count fails."""
+        src = tmp_path / "long.pdf"
+        src.write_bytes(b"%PDF-1.4 fake content")
+
+        parsed = MinerUParsedPdf(
+            markdown="# Long PDF",
+            pages=[{"page": page, "content": f"Page {page}", "images": []} for page in range(1, 21)],
+        )
+
+        with (
+            patch("openkb.converter.get_pdf_page_count", side_effect=ValueError("bad pdf")),
+            patch("openkb.converter.parse_pdf_with_mineru", return_value=parsed),
+        ):
+            result = convert_document(src, kb_dir)
+
+        assert result.is_long_doc is True
+        assert result.source_path is None
         assert result.raw_path is not None

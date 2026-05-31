@@ -27,6 +27,8 @@ classifiers = [
 keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "agents", "document"]
 dependencies = [
     "pageindex==0.3.0.dev1",
+    "mineru[all]>=2.0.0",
+    "pypdf>=6.4.0",
     "markitdown[docx,pptx,xlsx,xls]>=0.1.5",
     "trafilatura>=2.0",
     "click>=8.0",

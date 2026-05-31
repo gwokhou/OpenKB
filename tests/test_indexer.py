@@ -1,10 +1,15 @@
 """Tests for openkb.indexer."""
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-
-from openkb.indexer import IndexResult, _normalize_page_content, index_long_document
+from openkb.indexer import (
+    IndexResult,
+    _normalize_page_content,
+    _patch_pageindex_deepseek_json_mode,
+    index_long_document,
+)
 
 
 class TestNormalizePageContent:
@@ -42,7 +47,6 @@ class TestIndexLongDocument:
         col = MagicMock()
         col.add.return_value = doc_id
 
-        # get_document(doc_id, include_text=True) returns full document
         col.get_document.return_value = {
             "doc_id": doc_id,
             "doc_name": sample_tree["doc_name"],
@@ -51,7 +55,6 @@ class TestIndexLongDocument:
             "structure": sample_tree["structure"],
         }
 
-        # get_page_content returns empty list by default (overridden per test as needed)
         col.get_page_content.return_value = []
         return col
 
@@ -72,7 +75,7 @@ class TestIndexLongDocument:
         pdf_path.write_bytes(b"%PDF-1.4 fake")
 
         with patch("openkb.indexer.PageIndexClient", return_value=fake_client), \
-             patch("openkb.images.convert_pdf_to_pages", return_value=self._fake_pages()):
+             patch("openkb.indexer._convert_pdf_to_pages", return_value=self._fake_pages()):
             result = index_long_document(pdf_path, kb_dir)
 
         assert isinstance(result, IndexResult)
@@ -88,17 +91,12 @@ class TestIndexLongDocument:
 
         fake_client = MagicMock()
         fake_client.collection.return_value = fake_col
-        # Mock get_page_content to return page data
-        fake_col.get_page_content.return_value = [
-            {"page": 1, "content": "Page one text."},
-            {"page": 2, "content": "Page two text."},
-        ]
 
         pdf_path = tmp_path / "sample.pdf"
         pdf_path.write_bytes(b"%PDF-1.4 fake")
 
         with patch("openkb.indexer.PageIndexClient", return_value=fake_client), \
-             patch("openkb.images.convert_pdf_to_pages", return_value=self._fake_pages()):
+             patch("openkb.indexer._convert_pdf_to_pages", return_value=self._fake_pages()):
             index_long_document(pdf_path, kb_dir)
 
         json_file = kb_dir / "wiki" / "sources" / "sample.json"
@@ -120,7 +118,7 @@ class TestIndexLongDocument:
         pdf_path.write_bytes(b"%PDF-1.4 fake")
 
         with patch("openkb.indexer.PageIndexClient", return_value=fake_client), \
-             patch("openkb.images.convert_pdf_to_pages", return_value=self._fake_pages()):
+             patch("openkb.indexer._convert_pdf_to_pages", return_value=self._fake_pages()):
             index_long_document(pdf_path, kb_dir)
 
         summary_file = kb_dir / "wiki" / "summaries" / "sample.md"
@@ -141,10 +139,9 @@ class TestIndexLongDocument:
         pdf_path.write_bytes(b"%PDF-1.4 fake")
 
         with patch("openkb.indexer.PageIndexClient", return_value=fake_client) as mock_cls, \
-             patch("openkb.images.convert_pdf_to_pages", return_value=self._fake_pages()):
+             patch("openkb.indexer._convert_pdf_to_pages", return_value=self._fake_pages()):
             index_long_document(pdf_path, kb_dir)
 
-        # Verify PageIndexClient was instantiated with correct IndexConfig
         mock_cls.assert_called_once()
         _, kwargs = mock_cls.call_args
         ic = kwargs.get("index_config")
@@ -219,3 +216,81 @@ class TestIndexLongDocument:
                 assert "No page content extracted" in str(exc)
             else:
                 raise AssertionError("expected RuntimeError")
+
+
+class TestPageIndexDeepSeekJsonMode:
+    def test_patch_is_noop_for_non_deepseek_models(self):
+        import pageindex.index.page_index as page_index
+
+        original = page_index.llm_completion
+        restore = _patch_pageindex_deepseek_json_mode("gpt-4o-mini")
+
+        try:
+            assert page_index.llm_completion is original
+        finally:
+            restore()
+
+    def test_patch_adds_response_format_and_retries_empty_content(self, caplog):
+        import pageindex.index.page_index as page_index
+
+        usage = SimpleNamespace(prompt_tokens=11, completion_tokens=0, total_tokens=11)
+        responses = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=""),
+                        finish_reason="length",
+                    )
+                ],
+                usage=usage,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"ok": true}'),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=usage,
+            ),
+        ]
+        calls = []
+
+        def fake_completion(**kwargs):
+            calls.append(kwargs)
+            return responses.pop(0)
+
+        restore = _patch_pageindex_deepseek_json_mode("deepseek/deepseek-v4-pro")
+        try:
+            with patch("litellm.completion", side_effect=fake_completion):
+                result = page_index.llm_completion(
+                    "deepseek/deepseek-v4-pro",
+                    'Return json: {"ok": true}',
+                )
+        finally:
+            restore()
+
+        assert result == '{"ok": true}'
+        assert len(calls) == 2
+        assert calls[0]["response_format"] == {"type": "json_object"}
+        assert "finish_reason=length" in caplog.text
+        assert "prompt_hash=" in caplog.text
+        assert "usage=in:11,out:0,total:11" in caplog.text
+
+    def test_patch_treats_missing_toc_detected_as_non_toc(self, monkeypatch):
+        import pageindex.index.page_index as page_index
+
+        def missing_toc_detected(content, model=None):
+            raise KeyError("toc_detected")
+
+        monkeypatch.setattr(
+            page_index,
+            "toc_detector_single_page",
+            missing_toc_detected,
+        )
+
+        restore = _patch_pageindex_deepseek_json_mode("deepseek/deepseek-v4-pro")
+        try:
+            assert page_index.toc_detector_single_page("page", model="deepseek/x") == "no"
+        finally:
+            restore()
