@@ -18,6 +18,39 @@ def test_add_and_is_known(tmp_path):
     assert registry.is_known("deadbeef") is True
 
 
+def test_add_persist_failure_does_not_dirty_memory(tmp_path, monkeypatch):
+    registry = HashRegistry(tmp_path / "hashes.json")
+
+    def fail_persist(_data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(registry, "_persist", fail_persist)
+
+    try:
+        registry.add("deadbeef", {"filename": "test.pdf"})
+    except OSError:
+        pass
+
+    assert registry.is_known("deadbeef") is False
+
+
+def test_remove_persist_failure_does_not_dirty_memory(tmp_path, monkeypatch):
+    registry = HashRegistry(tmp_path / "hashes.json")
+    registry.add("deadbeef", {"doc_name": "doc"})
+
+    def fail_persist(_data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(registry, "_persist", fail_persist)
+
+    try:
+        registry.remove_by_hash("deadbeef")
+    except OSError:
+        pass
+
+    assert registry.is_known("deadbeef") is True
+
+
 def test_add_and_get(tmp_path):
     registry = HashRegistry(tmp_path / "hashes.json")
     metadata = {"filename": "doc.pdf", "pages": 10}

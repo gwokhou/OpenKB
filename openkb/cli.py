@@ -48,6 +48,7 @@ from openkb.config import DEFAULT_CONFIG, load_config, save_config, load_global_
 from openkb.converter import convert_document
 from openkb.locks import atomic_write_json, atomic_write_text  # noqa: E402
 from openkb.log import append_log
+from openkb.mutation import KbMutationContext, recover_pending_journals, snapshot_paths  # noqa: E402
 from openkb.schema import AGENTS_MD, INDEX_SEED, PAGE_CONTENT_DIRS
 
 # Suppress warnings after all imports — markitdown overrides filters at import time
@@ -272,6 +273,7 @@ class _PreparedAdd:
 
     file_path: Path
     result: object | None = None
+    staging_dir: Path | None = None
     outcome: _AddOutcome | None = None
     error_stage: str = ""
     error: Exception | None = None
@@ -353,44 +355,71 @@ def _registry_doc_name_conflict(registry, doc_name: str, file_hash: str | None) 
     return None
 
 
-def _convert_document_assume_locked(file_path: Path, kb_dir: Path):
+def _convert_document_assume_locked(
+    file_path: Path,
+    kb_dir: Path,
+    *,
+    staging_dir: Path | None = None,
+):
     import inspect
     from unittest.mock import Mock
 
     if isinstance(convert_document, Mock):
         return convert_document(file_path, kb_dir)
     signature = inspect.signature(convert_document)
+    kwargs = {}
     if "assume_locked" in signature.parameters:
-        return convert_document(file_path, kb_dir, assume_locked=True)
-    return convert_document(file_path, kb_dir)
+        kwargs["assume_locked"] = True
+    if "staging_dir" in signature.parameters:
+        kwargs["staging_dir"] = staging_dir
+    return convert_document(file_path, kb_dir, **kwargs)
 
 
-def _prepare_add_file(file_path: Path, kb_dir: Path) -> _PreparedAdd:
+def _prepare_add_file(
+    file_path: Path,
+    kb_dir: Path,
+    *,
+    staging_dir: Path | None = None,
+) -> _PreparedAdd:
     """Run the file-local producer stage: conversion, extraction, dedup."""
     logger = logging.getLogger(__name__)
     try:
-        result = _convert_document_assume_locked(file_path, kb_dir)
+        result = _convert_document_assume_locked(
+            file_path,
+            kb_dir,
+            staging_dir=staging_dir,
+        )
     except Exception as exc:
         logger.debug("Conversion traceback:", exc_info=True)
         return _PreparedAdd(
             file_path=file_path,
+            staging_dir=staging_dir,
             outcome="failed",
             error_stage="Conversion",
             error=exc,
         )
 
     if result.skipped:
-        return _PreparedAdd(file_path=file_path, outcome="skipped", result=result)
-    return _PreparedAdd(file_path=file_path, result=result)
+        return _PreparedAdd(
+            file_path=file_path,
+            outcome="skipped",
+            result=result,
+            staging_dir=staging_dir,
+        )
+    return _PreparedAdd(file_path=file_path, result=result, staging_dir=staging_dir)
 
 
-def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _AddOutcome:
+def _commit_prepared_add(
+    prepared: _PreparedAdd,
+    tx: KbMutationContext,
+    model: str,
+) -> _AddOutcome:
     """Run the serialized consumer stage: compile wiki, register hash, log."""
     from openkb.agent.compiler import compile_long_doc, compile_short_doc
-    from openkb.state import HashRegistry
 
     logger = logging.getLogger(__name__)
     file_path = prepared.file_path
+    kb_dir = tx.kb_dir
 
     if prepared.outcome == "failed":
         click.echo(f"  [ERROR] {prepared.error_stage} failed: {prepared.error}")
@@ -404,14 +433,12 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
         click.echo(f"  [ERROR] Conversion failed: no result for {file_path.name}")
         return "failed"
 
-    openkb_dir = kb_dir / ".openkb"
-    registry = HashRegistry(openkb_dir / "hashes.json")
-    if result.file_hash and registry.is_known(result.file_hash):
+    if result.file_hash and tx.registry.is_known(result.file_hash):
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
         return "skipped"
 
     doc_name = file_path.stem
-    conflict = _registry_doc_name_conflict(registry, doc_name, result.file_hash)
+    conflict = _registry_doc_name_conflict(tx.registry, doc_name, result.file_hash)
     if conflict:
         click.echo(
             "  [ERROR] Document name conflict: "
@@ -420,17 +447,68 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
         )
         return "failed"
     index_result = None
+    journal_details = {
+        "file_hash": result.file_hash,
+        "name": file_path.name,
+        "doc_name": doc_name,
+    }
+    publish_snapshot = tx.snapshot_paths([
+        kb_dir / "raw" / file_path.name,
+        kb_dir / "wiki" / "sources" / f"{doc_name}.md",
+        kb_dir / "wiki" / "sources" / f"{doc_name}.json",
+        kb_dir / "wiki" / "sources" / "images" / doc_name,
+        kb_dir / "wiki" / "summaries" / f"{doc_name}.md",
+        kb_dir / "wiki" / "concepts",
+        kb_dir / "wiki" / "entities",
+        kb_dir / "wiki" / "index.md",
+        kb_dir / "wiki" / "log.md",
+    ], operation="add", details=journal_details)
+
+    def rollback_publish() -> None:
+        rollback_error = publish_snapshot.rollback_best_effort()
+        discard_error = publish_snapshot.discard_best_effort()
+        if rollback_error is not None:
+            logger.warning("Add rollback did not fully restore KB: %s", rollback_error)
+        if discard_error is not None:
+            logger.debug("Rollback snapshot cleanup failed:", exc_info=discard_error)
+
+    def cleanup_pageindex_doc(doc_id: str | None) -> None:
+        if not doc_id:
+            return
+        try:
+            cleaned, msg = _cleanup_pageindex(
+                kb_dir / ".openkb", kb_dir, doc_name, doc_id,
+            )
+            if cleaned:
+                logger.debug("Rolled back PageIndex doc after add failure: %s", msg)
+        except Exception:
+            logger.warning("PageIndex rollback cleanup failed for %s", doc_id, exc_info=True)
+
+    try:
+        tx.install_staged_tree(prepared.staging_dir)
+    except Exception as exc:
+        click.echo(f"  [ERROR] Could not install staged files: {exc}")
+        logger.debug("Staged install traceback:", exc_info=True)
+        rollback_publish()
+        return "failed"
+
+    raw_path = kb_dir / "raw" / file_path.name
+    source_path = kb_dir / "wiki" / "sources" / f"{doc_name}.md"
 
     if result.is_long_doc:
         click.echo(f"  Long document detected — indexing with PageIndex...")
         try:
             from openkb.indexer import index_long_document
             index_result = index_long_document(
-                result.raw_path, kb_dir, assume_locked=True,
+                raw_path, kb_dir, assume_locked=True,
             )
+            publish_snapshot.details["doc_id"] = index_result.doc_id
+            publish_snapshot.write_journal("active")
         except Exception as exc:
             click.echo(f"  [ERROR] Indexing failed: {exc}")
             logger.debug("Indexing traceback:", exc_info=True)
+            cleanup_pageindex_doc(getattr(exc, "doc_id", None))
+            rollback_publish()
             return "failed"
 
         summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
@@ -456,6 +534,8 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
                 else:
                     click.echo(f"  [ERROR] Compilation failed: {exc}")
                     logger.debug("Compilation traceback:", exc_info=True)
+                    cleanup_pageindex_doc(index_result.doc_id)
+                    rollback_publish()
                     return "failed"
     else:
         click.echo(f"  Compiling short doc...")
@@ -463,7 +543,7 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
             try:
                 asyncio.run(
                     compile_short_doc(
-                        doc_name, result.source_path, kb_dir, model,
+                        doc_name, source_path, kb_dir, model,
                         assume_locked=True,
                     )
                 )
@@ -475,22 +555,68 @@ def _commit_prepared_add(prepared: _PreparedAdd, kb_dir: Path, model: str) -> _A
                 else:
                     click.echo(f"  [ERROR] Compilation failed: {exc}")
                     logger.debug("Compilation traceback:", exc_info=True)
+                    rollback_publish()
                     return "failed"
 
-    if result.file_hash:
-        doc_type = "long_pdf" if result.is_long_doc else file_path.suffix.lstrip(".")
-        meta = {
-            "name": file_path.name,
-            "doc_name": doc_name,
-            "type": doc_type,
-        }
-        if index_result is not None:
-            meta["doc_id"] = index_result.doc_id
-        registry.add(result.file_hash, meta)
+    try:
+        if result.file_hash:
+            publish_snapshot.write_journal("commit_started")
+            doc_type = "long_pdf" if result.is_long_doc else file_path.suffix.lstrip(".")
+            meta = {
+                "name": file_path.name,
+                "doc_name": doc_name,
+                "type": doc_type,
+            }
+            if index_result is not None:
+                meta["doc_id"] = index_result.doc_id
+            tx.registry.add(result.file_hash, meta)
+    except Exception:
+        cleanup_pageindex_doc(index_result.doc_id if index_result is not None else None)
+        rollback_publish()
+        raise
 
-    append_log(kb_dir / "wiki", "ingest", file_path.name, assume_locked=True)
+    try:
+        append_log(kb_dir / "wiki", "ingest", file_path.name, assume_locked=True)
+    except Exception as exc:
+        click.echo(f"  [WARN] Log update failed after registry commit: {exc}")
+        logger.debug("Log update traceback after add commit:", exc_info=True)
+
+    discard_error = publish_snapshot.discard_best_effort()
+    if discard_error is not None:
+        logger.debug("Rollback snapshot cleanup failed after successful add:", exc_info=discard_error)
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
     return "added"
+
+
+def _add_single_file_in_context(file_path: Path, tx: KbMutationContext) -> _AddOutcome:
+    config = load_config(tx.kb_dir / ".openkb" / "config.yaml")
+    _setup_llm_key(tx.kb_dir)
+    model: str = config.get("model", DEFAULT_CONFIG["model"])
+    click.echo(f"Adding: {file_path.name}")
+
+    try:
+        file_hash = tx.registry.hash_file(file_path)
+    except Exception as exc:
+        click.echo(f"  [ERROR] Hash failed: {exc}")
+        return "failed"
+    if tx.registry.is_known(file_hash):
+        click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
+        return "skipped"
+    conflict = _registry_doc_name_conflict(tx.registry, file_path.stem, file_hash)
+    if conflict:
+        click.echo(
+            "  [ERROR] Document name conflict: "
+            f"{file_path.name} compiles to doc_name '{file_path.stem}', already used by "
+            f"{conflict.get('name', 'another document')}. Rename this file before adding."
+        )
+        return "failed"
+
+    staging_dir = tx.staging_dir(file_path.stem)
+    prepared = _prepare_add_file(file_path, tx.kb_dir, staging_dir=staging_dir)
+    try:
+        return _commit_prepared_add(prepared, tx, model)
+    finally:
+        tx.cleanup_staging(staging_dir)
 
 
 def add_single_file(file_path: Path, kb_dir: Path) -> _AddOutcome:
@@ -510,32 +636,8 @@ def add_single_file(file_path: Path, kb_dir: Path) -> _AddOutcome:
         be an orphan) while preserving it on failure so the user can
         retry without re-downloading.
     """
-    openkb_dir = kb_dir / ".openkb"
-    config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
-    model: str = config.get("model", DEFAULT_CONFIG["model"])
-    click.echo(f"Adding: {file_path.name}")
-    with _kb_ingest_lock(openkb_dir):
-        from openkb.state import HashRegistry
-
-        registry = HashRegistry(openkb_dir / "hashes.json")
-        try:
-            file_hash = HashRegistry.hash_file(file_path)
-        except Exception as exc:
-            click.echo(f"  [ERROR] Hash failed: {exc}")
-            return "failed"
-        if registry.is_known(file_hash):
-            click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
-            return "skipped"
-        conflict = _registry_doc_name_conflict(registry, file_path.stem, file_hash)
-        if conflict:
-            click.echo(
-                "  [ERROR] Document name conflict: "
-                f"{file_path.name} compiles to doc_name '{file_path.stem}', already used by "
-                f"{conflict.get('name', 'another document')}. Rename this file before adding."
-            )
-            return "failed"
-        return _commit_prepared_add(_prepare_add_file(file_path, kb_dir), kb_dir, model)
+    with KbMutationContext(kb_dir) as tx:
+        return _add_single_file_in_context(file_path, tx)
 
 
 def _add_files_batch(
@@ -546,14 +648,13 @@ def _add_files_batch(
     buffer_size: int | None = None,
 ) -> dict[_AddOutcome, int]:
     """Process many files with bounded producer concurrency and serial commits."""
-    openkb_dir = kb_dir / ".openkb"
-    with _kb_ingest_lock(openkb_dir):
-        return _add_files_batch_locked(files, kb_dir, jobs=jobs, buffer_size=buffer_size)
+    with KbMutationContext(kb_dir) as tx:
+        return _add_files_batch_locked(files, tx, jobs=jobs, buffer_size=buffer_size)
 
 
 def _add_files_batch_locked(
     files: list[Path],
-    kb_dir: Path,
+    tx: KbMutationContext,
     *,
     jobs: int | None = None,
     buffer_size: int | None = None,
@@ -561,6 +662,7 @@ def _add_files_batch_locked(
     """Implementation for `_add_files_batch`; caller must hold ingest lock."""
     from openkb.state import HashRegistry
 
+    kb_dir = tx.kb_dir
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
     _setup_llm_key(kb_dir)
@@ -573,10 +675,10 @@ def _add_files_batch_locked(
     max_pending = max(1, worker_count + queued_buffer)
 
     counts: dict[_AddOutcome, int] = {"added": 0, "skipped": 0, "failed": 0}
-    registry = HashRegistry(openkb_dir / "hashes.json")
     seen_hashes: set[str] = set()
     seen_doc_names: dict[str, Path] = {}
     pending_files: list[Path] = []
+    staging_dirs: dict[Path, Path] = {}
 
     for file_path in files:
         doc_name = file_path.stem
@@ -587,7 +689,7 @@ def _add_files_batch_locked(
             click.echo(f"  [ERROR] Hash failed: {exc}")
             counts["failed"] += 1
             continue
-        if file_hash in seen_hashes or registry.is_known(file_hash):
+        if file_hash in seen_hashes or tx.registry.is_known(file_hash):
             click.echo(f"\nAdding: {file_path.name}")
             click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
             counts["skipped"] += 1
@@ -601,7 +703,7 @@ def _add_files_batch_locked(
             )
             counts["failed"] += 1
             continue
-        conflict = _registry_doc_name_conflict(registry, doc_name, file_hash)
+        conflict = _registry_doc_name_conflict(tx.registry, doc_name, file_hash)
         if conflict:
             click.echo(f"\nAdding: {file_path.name}")
             click.echo(
@@ -614,6 +716,7 @@ def _add_files_batch_locked(
         seen_hashes.add(file_hash)
         seen_doc_names[doc_name] = file_path
         pending_files.append(file_path)
+        staging_dirs[file_path] = tx.staging_dir(doc_name)
 
     def _drain(done: set[Future[_PreparedAdd]]) -> None:
         for future in done:
@@ -625,8 +728,11 @@ def _add_files_batch_locked(
                 counts["failed"] += 1
                 continue
             click.echo(f"\nAdding: {prepared.file_path.name}")
-            outcome = _commit_prepared_add(prepared, kb_dir, model)
-            counts[outcome] += 1
+            try:
+                outcome = _commit_prepared_add(prepared, tx, model)
+                counts[outcome] += 1
+            finally:
+                tx.cleanup_staging(prepared.staging_dir)
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         pending: set[Future[_PreparedAdd]] = set()
@@ -638,7 +744,12 @@ def _add_files_batch_locked(
                     file_path = next(iterator)
                 except StopIteration:
                     break
-                pending.add(executor.submit(_prepare_add_file, file_path, kb_dir))
+                pending.add(executor.submit(
+                    _prepare_add_file,
+                    file_path,
+                    kb_dir,
+                    staging_dir=staging_dirs[file_path],
+                ))
 
             if not pending:
                 break
@@ -828,9 +939,9 @@ def init(model, language):
         Path("wiki/entities").mkdir(parents=True, exist_ok=True)
 
         # Write wiki files
-        Path("wiki/AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
-        Path("wiki/index.md").write_text(INDEX_SEED, encoding="utf-8")
-        Path("wiki/log.md").write_text("# Operations Log\n\n", encoding="utf-8")
+        atomic_write_text(Path("wiki/AGENTS.md"), AGENTS_MD)
+        atomic_write_text(Path("wiki/index.md"), INDEX_SEED)
+        atomic_write_text(Path("wiki/log.md"), "# Operations Log\n\n")
 
         # Create .openkb/ state directory
         openkb_dir.mkdir()
@@ -852,7 +963,7 @@ def init(model, language):
             if env_path.exists():
                 click.echo(".env already exists, skipping write. Add LLM_API_KEY manually if needed.")
             else:
-                env_path.write_text(f"LLM_API_KEY={api_key}\n", encoding="utf-8")
+                atomic_write_text(env_path, f"LLM_API_KEY={api_key}\n")
                 os.chmod(env_path, 0o600)
                 click.echo("Saved LLM API key to .env.")
 
@@ -890,8 +1001,6 @@ def add(ctx, path, jobs, buffer_size):
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
-    openkb_dir = kb_dir / ".openkb"
-
     # URL ingest: download into raw/ first, then call add_single_file
     # explicitly so we can clean up the just-downloaded file if it
     # turns out to be a duplicate (registry already has its hash).
@@ -899,17 +1008,17 @@ def add(ctx, path, jobs, buffer_size):
     # that the registry can't reach via openkb remove.
     from openkb.url_ingest import looks_like_url, fetch_url_to_raw
     if looks_like_url(path):
-        with _kb_ingest_lock(openkb_dir):
+        with KbMutationContext(kb_dir) as tx:
             fetched = fetch_url_to_raw(path, kb_dir, assume_locked=True)
-        if fetched is None:
-            return
-        outcome = add_single_file(fetched, kb_dir)
-        # Only clean up on dedup-skip. On "failed" we keep the file so
-        # the user can retry (e.g. transient LLM error during compile)
-        # without re-downloading — and so they don't lose data when
-        # indexing has already succeeded but compilation didn't.
-        if outcome == "skipped":
-            fetched.unlink(missing_ok=True)
+            if fetched is None:
+                return
+            outcome = _add_single_file_in_context(fetched, tx)
+            # Only clean up on dedup-skip. On "failed" we keep the file so
+            # the user can retry (e.g. transient LLM error during compile)
+            # without re-downloading — and so they don't lose data when
+            # indexing has already succeeded but compilation didn't.
+            if outcome == "skipped":
+                fetched.unlink(missing_ok=True)
         return
 
     target = Path(path)
@@ -1001,9 +1110,9 @@ def query(ctx, question, save, raw):
                 # exist" can drift from disk reality.
                 known = list_existing_wiki_targets(kb_dir / "wiki")
                 cleaned_answer, _ = strip_ghost_wikilinks(answer, known)
-                explore_path.write_text(
+                atomic_write_text(
+                    explore_path,
                     f"---\nquery: \"{question}\"\n---\n\n{cleaned_answer}\n",
-                    encoding="utf-8",
                 )
                 saved_path = explore_path
     except Exception as exc:
@@ -1125,7 +1234,7 @@ def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
             kb_dir,
             identifier,
             keep_raw=keep_raw,
-            keep_empty_concepts=keep_empty_concepts,
+            keep_empty=keep_empty,
             dry_run=dry_run,
             yes=yes,
         )
@@ -1136,7 +1245,7 @@ def _remove_locked(
     identifier: str,
     *,
     keep_raw: bool,
-    keep_empty_concepts: bool,
+    keep_empty: bool,
     dry_run: bool,
     yes: bool,
 ) -> None:
@@ -1151,6 +1260,8 @@ def _remove_locked(
     from openkb.state import HashRegistry
 
     openkb_dir = kb_dir / ".openkb"
+    for message in recover_pending_journals(kb_dir):
+        logging.getLogger(__name__).warning(message)
     registry = HashRegistry(openkb_dir / "hashes.json")
 
     matches = _resolve_doc_identifier(registry, identifier)
@@ -1234,7 +1345,13 @@ def _remove_locked(
     # state exists on disk — short-doc-only KBs never created any.
     pageindex_doc_id = meta.get("doc_id")
     pageindex_state_exists = (openkb_dir / "pageindex.db").exists()
-    cleanup_pageindex = doc_type == "long_pdf" and pageindex_state_exists
+    pageindex_missing = bool(meta.get("pageindex_missing"))
+    cleanup_pageindex = doc_type == "long_pdf" and pageindex_state_exists and not pageindex_missing
+    if doc_type == "long_pdf" and pageindex_state_exists and pageindex_missing:
+        actions.append((
+            "PAGEINDEX",
+            "skip delete (registry marks PageIndex doc missing)",
+        ))
     if cleanup_pageindex:
         if pageindex_doc_id:
             actions.append((
@@ -1282,15 +1399,44 @@ def _remove_locked(
             return
 
     # ----- Execute -----
-    # Ordering rationale: every step before the registry write is
-    # idempotent (``unlink(missing_ok=True)``, ``shutil.rmtree(
-    # ignore_errors=True)``, concept/index helpers that no-op on
-    # already-clean state, and PageIndex's own delete-by-doc_id which
-    # uses ``missing_ok`` + ``if dir.exists()`` internally). The
-    # registry write is therefore the *commit point*: if anything
-    # before it raises (including PageIndex), the entry plus its
-    # ``doc_id`` survive and the user can simply re-run ``openkb
-    # remove`` to retry from a clean slate.
+    remove_snapshot = None
+    try:
+        remove_snapshot = snapshot_paths(kb_dir, [
+            summary_path,
+            source_md,
+            source_json,
+            images_dir,
+            wiki_dir / "concepts",
+            wiki_dir / "entities",
+            wiki_dir / "index.md",
+            wiki_dir / "log.md",
+            raw_path if raw_path is not None else kb_dir / "raw" / name,
+        ], operation="remove", details={
+            "file_hash": file_hash,
+            "name": name,
+            "doc_name": doc_name,
+            "doc_id": pageindex_doc_id,
+            "raw_path": str(raw_path) if raw_path is not None else None,
+        })
+    except Exception as exc:
+        click.echo(f"  [ERROR] Could not snapshot remove targets: {exc}")
+        logging.getLogger(__name__).debug("Remove snapshot traceback:", exc_info=True)
+        return
+
+    def rollback_remove() -> None:
+        if remove_snapshot is None:
+            return
+        rollback_error = remove_snapshot.rollback_best_effort()
+        discard_error = remove_snapshot.discard_best_effort()
+        if rollback_error is not None:
+            logging.getLogger(__name__).warning(
+                "Remove rollback did not fully restore KB: %s", rollback_error,
+            )
+        if discard_error is not None:
+            logging.getLogger(__name__).debug(
+                "Remove snapshot cleanup failed:", exc_info=discard_error,
+            )
+
     summary_path.unlink(missing_ok=True)
     source_md.unlink(missing_ok=True)
     source_json.unlink(missing_ok=True)
@@ -1300,14 +1446,14 @@ def _remove_locked(
     concept_result = remove_doc_from_concept_pages(
         wiki_dir,
         doc_name,
-        keep_empty=keep_empty_concepts,
+        keep_empty=keep_empty,
         assume_locked=True,
     )
 
     entity_result = remove_doc_from_entity_pages(
         wiki_dir,
         doc_name,
-        keep_empty=keep_empty_concepts,
+        keep_empty=keep_empty,
         assume_locked=True,
     )
 
@@ -1354,30 +1500,90 @@ def _remove_locked(
     # add`` and the user would get the old parse back without warning.
     if cleanup_pageindex:
         try:
+            remove_snapshot.write_journal("pageindex_delete_started")
             cleaned, msg = _cleanup_pageindex(
                 openkb_dir, kb_dir, doc_name, pageindex_doc_id,
             )
+            if cleaned:
+                remove_snapshot.details["pageindex_deleted"] = True
+                remove_snapshot.write_journal("pageindex_deleted")
+            else:
+                remove_snapshot.details["pageindex_deleted"] = False
+                remove_snapshot.write_journal("active")
             click.echo(f"  PageIndex: {msg}")
         except Exception as exc:
             click.echo(
                 f"  [WARN] PageIndex cleanup failed: {exc} "
-                f"— registry entry kept; re-run `openkb remove {name}` to retry"
+                f"— changes rolled back; re-run `openkb remove {name}` to retry"
             )
             logging.getLogger(__name__).debug(
                 "PageIndex cleanup traceback:", exc_info=True,
             )
+            rollback_remove()
             return
 
     # ----- Commit point -----
     # Prune by hash, not by ``doc_name``: legacy registry entries
     # (ingested before commit c504e26) carry only ``{name, type}`` and
     # would silently no-op under ``remove_by_doc_name``. See issue #58.
-    registry.remove_by_hash(file_hash)
+    try:
+        remove_snapshot.write_journal("commit_started")
+        registry.remove_by_hash(file_hash)
+    except Exception as exc:
+        click.echo(
+            f"  [ERROR] Registry update failed: {exc} "
+            f"— wiki changes rolled back; re-run `openkb remove {name}` to retry"
+        )
+        if cleanup_pageindex:
+            marked_pageindex_missing = False
+            try:
+                marked_pageindex_missing = registry.mark_pageindex_missing(
+                    file_hash,
+                    "registry_commit_failed_after_pageindex_cleanup",
+                )
+            except Exception as mark_exc:
+                click.echo(f"  [WARN] Could not mark PageIndex state in registry: {mark_exc}")
+                logging.getLogger(__name__).debug(
+                    "PageIndex missing marker traceback:", exc_info=True,
+                )
+            if marked_pageindex_missing:
+                click.echo(
+                    "  [WARN] PageIndex cleanup may already have completed; "
+                    "the registry entry was kept and marked pageindex_missing."
+                )
+            else:
+                click.echo(
+                    "  [WARN] PageIndex cleanup may already have completed; "
+                    "the registry entry was kept, but could not be marked pageindex_missing."
+                )
+        logging.getLogger(__name__).debug(
+            "Registry remove traceback:", exc_info=True,
+        )
+        rollback_remove()
+        return
 
     if raw_path is not None:
-        raw_path.unlink(missing_ok=True)
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception as exc:
+            click.echo(f"  [WARN] Raw file cleanup failed after registry commit: {exc}")
+            logging.getLogger(__name__).debug(
+                "Raw cleanup traceback after remove commit:", exc_info=True,
+            )
 
-    append_log(wiki_dir, "remove", name, assume_locked=True)
+    try:
+        append_log(wiki_dir, "remove", name, assume_locked=True)
+    except Exception as exc:
+        click.echo(f"  [WARN] Log update failed after registry commit: {exc}")
+        logging.getLogger(__name__).debug(
+            "Log update traceback after remove commit:", exc_info=True,
+        )
+    discard_error = remove_snapshot.discard_best_effort()
+    if discard_error is not None:
+        logging.getLogger(__name__).debug(
+            "Remove snapshot cleanup failed after successful remove:",
+            exc_info=discard_error,
+        )
     click.echo(f"  [OK] {name} removed from knowledge base.")
 
 
@@ -1958,6 +2164,111 @@ def status(ctx):
         return
     with _kb_read_lock(kb_dir / ".openkb"):
         print_status(kb_dir)
+
+
+def _doctor_issues(kb_dir: Path, *, repair: bool = False) -> tuple[list[str], list[str]]:
+    """Return consistency issues and optional repair messages for a KB."""
+    from openkb.state import HashRegistry
+
+    openkb_dir = kb_dir / ".openkb"
+    wiki_dir = kb_dir / "wiki"
+    issues: list[str] = []
+    repairs: list[str] = []
+
+    journal_dir = openkb_dir / "journal"
+    journal_backup_dirs: set[Path] = set()
+    if journal_dir.is_dir():
+        for journal_path in sorted(journal_dir.glob("*.json")):
+            issues.append(f"PENDING_JOURNAL {journal_path.relative_to(kb_dir)}")
+            try:
+                data = json.loads(journal_path.read_text(encoding="utf-8"))
+                backup_dir = data.get("backup_dir")
+                if backup_dir:
+                    journal_backup_dirs.add(Path(backup_dir).resolve())
+            except Exception:
+                pass
+
+    staging_dir = openkb_dir / "staging"
+    if staging_dir.is_dir():
+        for rollback_dir in sorted(staging_dir.glob("rollback-*")):
+            if rollback_dir.resolve() in journal_backup_dirs:
+                continue
+            if repair:
+                shutil.rmtree(rollback_dir, ignore_errors=True)
+                repairs.append(f"Removed orphan staging {rollback_dir.relative_to(kb_dir)}")
+            else:
+                issues.append(f"ORPHAN_STAGING {rollback_dir.relative_to(kb_dir)}")
+
+    registry = HashRegistry(openkb_dir / "hashes.json")
+    registry_doc_names: set[str] = set()
+    for file_hash, meta in sorted(registry.all_entries().items()):
+        name = meta.get("name") or "?"
+        doc_name = meta.get("doc_name") or Path(name).stem
+        registry_doc_names.add(doc_name)
+        if meta.get("pageindex_missing"):
+            reason = meta.get("pageindex_missing_reason", "unknown")
+            issues.append(f"PAGEINDEX_MISSING {file_hash} {name} reason={reason}")
+        if meta.get("pageindex_uncertain"):
+            reason = meta.get("pageindex_uncertain_reason", "unknown")
+            issues.append(f"PAGEINDEX_UNCERTAIN {file_hash} {name} reason={reason}")
+
+        summary_path = wiki_dir / "summaries" / f"{doc_name}.md"
+        if not summary_path.exists():
+            issues.append(f"MISSING_SUMMARY {file_hash} {summary_path.relative_to(kb_dir)}")
+
+        source_ext = ".json" if meta.get("type") == "long_pdf" else ".md"
+        source_path = wiki_dir / "sources" / f"{doc_name}{source_ext}"
+        if not source_path.exists():
+            issues.append(f"MISSING_SOURCE {file_hash} {source_path.relative_to(kb_dir)}")
+
+        raw_candidates: list[Path] = []
+        raw_path = meta.get("path")
+        if raw_path:
+            raw_candidates.append((kb_dir / raw_path).resolve())
+        if name != "?":
+            raw_candidates.append((kb_dir / "raw" / name).resolve())
+        if raw_candidates and not any(path.exists() for path in raw_candidates):
+            display_path = raw_candidates[0]
+            try:
+                display = display_path.relative_to(kb_dir)
+            except ValueError:
+                display = display_path
+            issues.append(f"MISSING_RAW {file_hash} {display}")
+
+    summaries_dir = wiki_dir / "summaries"
+    if summaries_dir.is_dir():
+        for summary_path in sorted(summaries_dir.glob("*.md")):
+            if summary_path.stem not in registry_doc_names:
+                issues.append(f"ORPHAN_SUMMARY {summary_path.relative_to(kb_dir)}")
+
+    return issues, repairs
+
+
+@cli.command()
+@click.option("--repair", is_flag=True, default=False,
+              help="Clean safe local leftovers such as orphan rollback staging dirs.")
+@click.pass_context
+def doctor(ctx, repair):
+    """Check KB consistency and optionally repair safe local leftovers."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    lock = _kb_ingest_lock if repair else _kb_read_lock
+    with lock(kb_dir / ".openkb"):
+        if repair:
+            for message in recover_pending_journals(kb_dir):
+                click.echo(f"Recovered: {message}")
+        issues, repairs = _doctor_issues(kb_dir, repair=repair)
+
+    if not issues and not repairs:
+        click.echo("No consistency issues found.")
+        return
+    for repair_msg in repairs:
+        click.echo(f"Repaired: {repair_msg}")
+    for issue in issues:
+        click.echo(issue)
 
 
 # ---------------------------------------------------------------------------

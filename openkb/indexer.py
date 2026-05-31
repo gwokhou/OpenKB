@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import hashlib
-import json as json_mod
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,10 +14,11 @@ from typing import Any
 from pageindex import IndexConfig, PageIndexClient
 
 from openkb.config import load_config
-from openkb.locks import kb_ingest_lock
+from openkb.locks import atomic_write_json, atomic_write_text, kb_ingest_lock
 from openkb.tree_renderer import render_summary_md
 
 logger = logging.getLogger(__name__)
+_PAGEINDEX_PATCH_LOCK = threading.RLock()
 
 
 @dataclass
@@ -27,6 +28,14 @@ class IndexResult:
     doc_id: str
     description: str
     tree: dict
+
+
+class PageIndexAddError(RuntimeError):
+    """Raised when PageIndex created a document but indexing did not finish."""
+
+    def __init__(self, message: str, *, doc_id: str | None = None) -> None:
+        super().__init__(message)
+        self.doc_id = doc_id
 
 
 def _normalize_page_content(raw_pages: Any) -> list[dict[str, Any]]:
@@ -422,76 +431,90 @@ def index_long_document(
     )
     col = client.collection()
 
-    # Add PDF (retry up to 3 times; PageIndex TOC accuracy is stochastic).
     max_retries = 3
     doc_id = None
-    restore_pageindex = _patch_pageindex_deepseek_json_mode(model)
-    for attempt in range(1, max_retries + 1):
+    with _PAGEINDEX_PATCH_LOCK:
+        restore_pageindex = _patch_pageindex_deepseek_json_mode(model)
         try:
-            try:
-                doc_id = col.add(str(pdf_path))
-            finally:
-                restore_pageindex()
-            logger.info("PageIndex added %s -> doc_id=%s (attempt %d)", pdf_path.name, doc_id, attempt)
-            break
-        except Exception as exc:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    doc_id = col.add(str(pdf_path))
+                    logger.info(
+                        "PageIndex added %s -> doc_id=%s (attempt %d)",
+                        pdf_path.name,
+                        doc_id,
+                        attempt,
+                    )
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "PageIndex attempt %d/%d failed for %s: %s",
+                        attempt,
+                        max_retries,
+                        pdf_path.name,
+                        exc,
+                    )
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"Failed to index {pdf_path.name} after {max_retries} attempts: {exc}"
+                        ) from exc
+        finally:
             restore_pageindex()
-            logger.warning("PageIndex attempt %d/%d failed for %s: %s", attempt, max_retries, pdf_path.name, exc)
-            if attempt == max_retries:
-                raise RuntimeError(f"Failed to index {pdf_path.name} after {max_retries} attempts: {exc}") from exc
-            restore_pageindex = _patch_pageindex_deepseek_json_mode(model)
 
-    # Fetch complete document (metadata + structure + text).
-    doc = col.get_document(doc_id, include_text=True)
-    doc_name: str = doc.get("doc_name", pdf_path.stem)
-    description: str = doc.get("doc_description", "")
-    structure: list = doc.get("structure", [])
+    try:
+        doc = col.get_document(doc_id, include_text=True)
+        doc_name: str = doc.get("doc_name", pdf_path.stem)
+        description: str = doc.get("doc_description", "")
+        structure: list = doc.get("structure", [])
 
-    logger.info("Doc keys: %s", list(doc.keys()))
-    logger.info("page_count from doc: %s", doc.get("page_count", "NOT PRESENT"))
+        logger.info("Doc keys: %s", list(doc.keys()))
+        logger.info("page_count from doc: %s", doc.get("page_count", "NOT PRESENT"))
 
-    tree = {
-        "doc_name": doc_name,
-        "doc_description": description,
-        "structure": structure,
-    }
+        tree = {
+            "doc_name": doc_name,
+            "doc_description": description,
+            "structure": structure,
+        }
 
-    sources_dir = kb_dir / "wiki" / "sources"
-    sources_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = sources_dir / "images" / pdf_path.stem
+        sources_dir = kb_dir / "wiki" / "sources"
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        images_dir = sources_dir / "images" / pdf_path.stem
 
-    all_pages: list[dict[str, Any]] = []
-    if pageindex_api_key:
-        page_count = _get_pdf_page_count(pdf_path)
-        try:
-            all_pages = _normalize_page_content(col.get_page_content(doc_id, f"1-{page_count}"))
-        except Exception as exc:
-            logger.warning("Cloud get_page_content failed for %s: %s", pdf_path.name, exc)
-
-    if not all_pages:
+        all_pages: list[dict[str, Any]] = []
         if pageindex_api_key:
-            logger.warning("Cloud returned no pages for %s; falling back to MinerU", pdf_path.name)
-        all_pages = _normalize_page_content(
-            _convert_pdf_to_pages(
-                pdf_path,
-                pdf_path.stem,
-                images_dir,
-                mineru_output_dir,
-                mineru_backend,
-                assume_locked=True,
+            page_count = _get_pdf_page_count(pdf_path)
+            try:
+                all_pages = _normalize_page_content(col.get_page_content(doc_id, f"1-{page_count}"))
+            except Exception as exc:
+                logger.warning("Cloud get_page_content failed for %s: %s", pdf_path.name, exc)
+
+        if not all_pages:
+            if pageindex_api_key:
+                logger.warning("Cloud returned no pages for %s; falling back to MinerU", pdf_path.name)
+            all_pages = _normalize_page_content(
+                _convert_pdf_to_pages(
+                    pdf_path,
+                    pdf_path.stem,
+                    images_dir,
+                    mineru_output_dir,
+                    mineru_backend,
+                    assume_locked=True,
+                )
             )
-        )
 
-    if not all_pages:
-        raise RuntimeError(f"No page content extracted for {pdf_path.name}")
+        if not all_pages:
+            raise RuntimeError(f"No page content extracted for {pdf_path.name}")
 
-    (sources_dir / f"{pdf_path.stem}.json").write_text(
-        json_mod.dumps(all_pages, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+        atomic_write_json(sources_dir / f"{pdf_path.stem}.json", all_pages, ensure_ascii=False)
 
-    summaries_dir = kb_dir / "wiki" / "summaries"
-    summaries_dir.mkdir(parents=True, exist_ok=True)
-    summary_md = render_summary_md(tree, pdf_path.stem, doc_id)
-    (summaries_dir / f"{pdf_path.stem}.md").write_text(summary_md, encoding="utf-8")
+        summaries_dir = kb_dir / "wiki" / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        summary_md = render_summary_md(tree, pdf_path.stem, doc_id)
+        atomic_write_text(summaries_dir / f"{pdf_path.stem}.md", summary_md)
 
-    return IndexResult(doc_id=doc_id, description=description, tree=tree)
+        return IndexResult(doc_id=doc_id, description=description, tree=tree)
+    except Exception as exc:
+        raise PageIndexAddError(
+            f"PageIndex post-add indexing failed for {pdf_path.name}: {exc}",
+            doc_id=doc_id,
+        ) from exc

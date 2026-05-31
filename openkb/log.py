@@ -1,6 +1,7 @@
 """Append-only operation log for the wiki (log.md)."""
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -20,8 +21,11 @@ def append_log(
 
     kb_dir = wiki_dir.parent if wiki_dir.name == "wiki" else None
     with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
-        if not log_path.exists():
-            log_path.write_text("# Operations Log\n\n" + entry, encoding="utf-8")
-        else:
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(entry)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        needs_header = not log_path.exists()
+        with log_path.open("a", encoding="utf-8") as fh:
+            if needs_header:
+                fh.write("# Operations Log\n\n")
+            fh.write(entry)
+            fh.flush()
+            os.fsync(fh.fileno())

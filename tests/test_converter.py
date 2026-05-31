@@ -70,6 +70,21 @@ class TestConvertDocumentMarkdown:
         assert result.raw_path is not None
         assert result.raw_path.exists()
 
+    def test_md_staging_keeps_final_kb_untouched_until_commit(self, kb_dir):
+        """Producer conversion writes staged artifacts, not final wiki paths."""
+        src = kb_dir / "input" / "notes.md"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("# Notes\n", encoding="utf-8")
+        staging = kb_dir / ".openkb" / "staging" / "notes-test"
+
+        result = convert_document(src, kb_dir, assume_locked=True, staging_dir=staging)
+
+        assert result.raw_path == staging / "raw" / "notes.md"
+        assert result.source_path == staging / "wiki" / "sources" / "notes.md"
+        assert result.source_path.exists()
+        assert not (kb_dir / "wiki" / "sources" / "notes.md").exists()
+        assert not (kb_dir / "raw" / "notes.md").exists()
+
 
 # ---------------------------------------------------------------------------
 # convert_document — PDF short doc

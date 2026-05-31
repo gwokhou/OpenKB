@@ -7,7 +7,6 @@ stdout to preserve the existing ``query`` visual.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import sys
@@ -468,7 +467,9 @@ def _save_transcript(kb_dir: Path, session: ChatSession, name: str | None) -> Pa
             lines.append("_(no response recorded)_")
         lines.append("")
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    from openkb.locks import atomic_write_text
+
+    atomic_write_text(path, "\n".join(lines))
     return path
 
 
@@ -497,12 +498,12 @@ async def _run_add(arg: str, kb_dir: Path, style: Style) -> None:
         _fmt(style, ("class:slash.help", f"Found {total} supported file(s) in {arg}.\n"))
         for i, f in enumerate(files, 1):
             _fmt(style, ("class:slash.help", f"\n[{i}/{total}] "))
-            await asyncio.to_thread(add_single_file, f, kb_dir)
+            add_single_file(f, kb_dir)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             _fmt(style, ("class:error", f"Unsupported file type: {target.suffix}\n"))
             return
-        await asyncio.to_thread(add_single_file, target, kb_dir)
+        add_single_file(target, kb_dir)
 
 
 async def _handle_slash_skill(arg: str, kb_dir: Path, style: Style) -> None:

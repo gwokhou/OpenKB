@@ -31,7 +31,7 @@ import litellm
 import yaml
 
 from openkb.config import DEFAULT_ENTITY_TYPES, resolve_entity_types
-from openkb.locks import kb_ingest_lock, maybe_kb_ingest_lock
+from openkb.locks import atomic_write_text, kb_ingest_lock, maybe_kb_ingest_lock
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
 from openkb.schema import INDEX_SEED, get_agents_md
 
@@ -800,7 +800,7 @@ def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
         f"full_text: sources/{doc_name}.{ext}",
     ]
     frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-    (summaries_dir / f"{doc_name}.md").write_text(frontmatter + summary, encoding="utf-8")
+    atomic_write_text(summaries_dir / f"{doc_name}.md", frontmatter + summary)
 
 
 _SAFE_NAME_RE = re.compile(r'[^\w\-]')
@@ -888,7 +888,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
                 else:
                     fm = fm.replace("---\n", f"---\n{brief_line}\n", 1)
                 existing = fm + body
-        path.write_text(existing, encoding="utf-8")
+        atomic_write_text(path, existing)
     else:
         if content.startswith("---"):
             end = content.find("---", 3)
@@ -898,7 +898,7 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         if brief:
             fm_lines.append(_yaml_kv_line("brief", brief))
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-        path.write_text(frontmatter + content, encoding="utf-8")
+        atomic_write_text(path, frontmatter + content)
 
 
 def _write_entity(
@@ -1074,7 +1074,7 @@ def _add_related_link(
         text = _prepend_source_to_frontmatter(text, source_file)
 
     text += f"\n\nSee also: {link}"
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
     return True
 
 
@@ -1101,7 +1101,7 @@ def _backlink_summary_pages(
     _ensure_h2_section(lines, section, quiet=True)
     for slug in reversed(missing):
         _insert_section_entry(lines, section, f"- [[{page_dir}/{slug}]]")
-    summary_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(summary_path, "\n".join(lines))
 
 
 def _backlink_pages(
@@ -1122,7 +1122,7 @@ def _backlink_pages(
         lines = text.split("\n")
         _ensure_h2_section(lines, "## Related Documents", quiet=True)
         _insert_section_entry(lines, "## Related Documents", f"- {link}")
-        path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(path, "\n".join(lines))
 
 
 def _backlink_summary(wiki_dir: Path, doc_name: str, concept_slugs: list[str]) -> None:
@@ -1237,7 +1237,7 @@ def _remove_doc_from_pages(
             path.unlink()
             deleted.append(path.stem)
         elif new_text != text:
-            path.write_text(new_text, encoding="utf-8")
+            atomic_write_text(path, new_text)
             modified.append(path.stem)
 
     return {"modified": modified, "deleted": deleted}
@@ -1356,7 +1356,7 @@ def remove_doc_from_index(
         while _remove_section_entry(lines, "## Entities", entity_link):
             pass
 
-    index_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(index_path, "\n".join(lines))
 
 
 def _update_index(
@@ -1380,7 +1380,7 @@ def _update_index(
 
     index_path = wiki_dir / "index.md"
     if not index_path.exists():
-        index_path.write_text(INDEX_SEED, encoding="utf-8")
+        atomic_write_text(index_path, INDEX_SEED)
 
     lines = index_path.read_text(encoding="utf-8").split("\n")
 
@@ -1426,7 +1426,7 @@ def _update_index(
         else:
             _insert_section_entry(lines, "## Entities", entry)
 
-    index_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(index_path, "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

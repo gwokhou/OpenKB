@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from openkb.locks import maybe_kb_ingest_lock
+from openkb.locks import atomic_write_text, maybe_kb_ingest_lock, maybe_kb_read_lock
 from openkb.agent.tools import (
     get_wiki_page_content as _get_wiki_page_content,
     list_wiki_files as _list_wiki_files,
@@ -42,7 +42,10 @@ def list_wiki_dir(directory: str, wiki_root: str) -> str:
         directory: Path relative to *wiki_root* (e.g. ``"concepts"``).
         wiki_root: Absolute path to ``<kb>/wiki``.
     """
-    return _list_wiki_files(directory, wiki_root)
+    root = Path(wiki_root).resolve()
+    kb_dir = root.parent if root.name == "wiki" and (root.parent / ".openkb").is_dir() else None
+    with maybe_kb_read_lock(kb_dir):
+        return _list_wiki_files(directory, wiki_root)
 
 
 def read_wiki_file_for_skill(path: str, wiki_root: str) -> str:
@@ -54,7 +57,10 @@ def read_wiki_file_for_skill(path: str, wiki_root: str) -> str:
         path: File path relative to *wiki_root* (e.g. ``"concepts/attention.md"``).
         wiki_root: Absolute path to ``<kb>/wiki``.
     """
-    return _read_wiki_file(path, wiki_root)
+    root = Path(wiki_root).resolve()
+    kb_dir = root.parent if root.name == "wiki" and (root.parent / ".openkb").is_dir() else None
+    with maybe_kb_read_lock(kb_dir):
+        return _read_wiki_file(path, wiki_root)
 
 
 def get_skill_page_content(doc_name: str, pages: str, wiki_root: str) -> str:
@@ -97,7 +103,7 @@ def write_skill_file(
     kb_dir = _kb_dir_for_skill_root(root)
     with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
         full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content, encoding="utf-8")
+        atomic_write_text(full, content)
     return f"Written: {path}"
 
 

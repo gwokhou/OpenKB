@@ -580,6 +580,31 @@ def test_url_ingest_cleans_up_orphan_on_dedup_skip(tmp_path, monkeypatch):
     assert not fetched_path.exists()
 
 
+def test_url_ingest_uses_transaction_instead_of_reentering_add_single_file(tmp_path):
+    """URL ingest should keep fetch + add in one mutation transaction."""
+    from click.testing import CliRunner
+    from openkb.cli import cli
+    from openkb.converter import ConvertResult
+
+    (tmp_path / ".openkb").mkdir()
+    (tmp_path / ".openkb" / "config.yaml").write_text("model: gpt-4o-mini\n")
+    (tmp_path / ".openkb" / "hashes.json").write_text("{}")
+    (tmp_path / "raw").mkdir()
+
+    fetched_path = tmp_path / "raw" / "paper.md"
+    fetched_path.write_text("# Paper")
+
+    runner = CliRunner()
+    with patch("openkb.cli._find_kb_dir", return_value=tmp_path), \
+         patch("openkb.url_ingest.fetch_url_to_raw", return_value=fetched_path), \
+         patch("openkb.cli.add_single_file", side_effect=AssertionError("reentered public add")), \
+         patch("openkb.cli.convert_document", return_value=ConvertResult(skipped=True)):
+        result = runner.invoke(cli, ["add", "https://example.com/paper"])
+
+    assert result.exit_code == 0, result.output
+    assert "[SKIP]" in result.output
+
+
 def test_url_ingest_keeps_raw_file_on_pipeline_failure(tmp_path):
     """The point of the tri-state return: a pipeline failure (e.g. LLM
     timeout during compilation) must NOT delete the downloaded file —

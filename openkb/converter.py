@@ -10,7 +10,7 @@ from markitdown import MarkItDown
 
 from openkb.config import load_config
 from openkb.images import copy_relative_images, extract_base64_images
-from openkb.locks import kb_ingest_lock
+from openkb.locks import atomic_write_text, kb_ingest_lock
 from openkb.pdf_parser import convert_pdf_to_markdown, get_pdf_page_count, parse_pdf_with_mineru
 from openkb.state import HashRegistry
 
@@ -26,9 +26,16 @@ class ConvertResult:
     is_long_doc: bool = False
     skipped: bool = False
     file_hash: str | None = None  # For deferred hash registration
+    staging_dir: Path | None = None
 
 
-def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) -> ConvertResult:
+def convert_document(
+    src: Path,
+    kb_dir: Path,
+    *,
+    assume_locked: bool = False,
+    staging_dir: Path | None = None,
+) -> ConvertResult:
     """Convert a document and integrate it into the knowledge base.
 
     Steps:
@@ -41,7 +48,12 @@ def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) ->
     """
     if not assume_locked:
         with kb_ingest_lock(kb_dir / ".openkb"):
-            return convert_document(src, kb_dir, assume_locked=True)
+            return convert_document(
+                src,
+                kb_dir,
+                assume_locked=True,
+                staging_dir=staging_dir,
+            )
 
     # ------------------------------------------------------------------
     # Load config & state
@@ -50,7 +62,8 @@ def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) ->
     config = load_config(openkb_dir / "config.yaml")
     threshold: int = config.get("pageindex_threshold", 20)
     mineru_backend: str = config.get("mineru_backend", "hybrid-auto-engine")
-    mineru_output_dir = kb_dir / config.get("mineru_output_dir", ".openkb/mineru")
+    artifact_root = staging_dir if staging_dir is not None else kb_dir
+    mineru_output_dir = artifact_root / config.get("mineru_output_dir", ".openkb/mineru")
     registry = HashRegistry(openkb_dir / "hashes.json")
 
     # ------------------------------------------------------------------
@@ -59,12 +72,12 @@ def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) ->
     file_hash = HashRegistry.hash_file(src)
     if registry.is_known(file_hash):
         logger.info("Skipping already-known file: %s", src.name)
-        return ConvertResult(skipped=True)
+        return ConvertResult(skipped=True, staging_dir=staging_dir)
 
     # ------------------------------------------------------------------
     # 2. Copy to raw/
     # ------------------------------------------------------------------
-    raw_dir = kb_dir / "raw"
+    raw_dir = artifact_root / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     raw_dest = raw_dir / src.name
     if raw_dest.resolve() != src.resolve():
@@ -86,14 +99,19 @@ def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) ->
                 threshold,
                 src.name,
             )
-            return ConvertResult(raw_path=raw_dest, is_long_doc=True, file_hash=file_hash)
+            return ConvertResult(
+                raw_path=raw_dest,
+                is_long_doc=True,
+                file_hash=file_hash,
+                staging_dir=staging_dir,
+            )
 
     # ------------------------------------------------------------------
     # 4/5. Convert to Markdown
     # ------------------------------------------------------------------
-    sources_dir = kb_dir / "wiki" / "sources"
+    sources_dir = artifact_root / "wiki" / "sources"
     sources_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = kb_dir / "wiki" / "sources" / "images" / src.stem
+    images_dir = artifact_root / "wiki" / "sources" / "images" / src.stem
     images_dir.mkdir(parents=True, exist_ok=True)
 
     doc_name = src.stem
@@ -125,7 +143,12 @@ def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) ->
                     threshold,
                     src.name,
                 )
-                return ConvertResult(raw_path=raw_dest, is_long_doc=True, file_hash=file_hash)
+                return ConvertResult(
+                    raw_path=raw_dest,
+                    is_long_doc=True,
+                    file_hash=file_hash,
+                    staging_dir=staging_dir,
+                )
             markdown = parsed.markdown
         else:
             markdown = convert_pdf_to_markdown(
@@ -149,6 +172,11 @@ def convert_document(src: Path, kb_dir: Path, *, assume_locked: bool = False) ->
         )
 
     dest_md = sources_dir / f"{doc_name}.md"
-    dest_md.write_text(markdown, encoding="utf-8")
+    atomic_write_text(dest_md, markdown)
 
-    return ConvertResult(raw_path=raw_dest, source_path=dest_md, file_hash=file_hash)
+    return ConvertResult(
+        raw_path=raw_dest,
+        source_path=dest_md,
+        file_hash=file_hash,
+        staging_dir=staging_dir,
+    )

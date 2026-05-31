@@ -9,7 +9,6 @@ references before the history is reused or persisted.
 from __future__ import annotations
 
 import json
-import os
 import random
 import string
 import threading
@@ -17,8 +16,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Any
+
+from openkb.locks import atomic_write_json
 
 
 _IMAGE_HISTORY_NOTE = (
@@ -204,19 +204,7 @@ class ChatSession:
             with session_lock(kb_dir, self.id):
                 return self.save(assume_locked=True)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self.path.parent,
-            prefix=f".{self.path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp = Path(fh.name)
-            json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2, default=str)
-            fh.flush()
-        os.replace(tmp, self.path)
+        atomic_write_json(self.path, self.to_dict(), ensure_ascii=False, default=str)
 
     def record_turn(
         self,

@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+
+from openkb.locks import atomic_write_json
 
 
 class HashRegistry:
@@ -39,15 +40,53 @@ class HashRegistry:
 
     def add(self, file_hash: str, metadata: dict) -> None:
         """Register file_hash with metadata and persist to disk."""
-        self._data[file_hash] = metadata
-        self._persist()
+        new_data = dict(self._data)
+        new_data[file_hash] = metadata
+        self._persist(new_data)
+        self._data = new_data
+
+    def update(self, file_hash: str, updates: dict) -> bool:
+        """Merge metadata updates for ``file_hash``. Returns True if updated."""
+        if file_hash not in self._data:
+            return False
+        new_data = dict(self._data)
+        new_metadata = dict(new_data[file_hash])
+        new_metadata.update(updates)
+        new_data[file_hash] = new_metadata
+        self._persist(new_data)
+        self._data = new_data
+        return True
+
+    def mark_pageindex_missing(self, file_hash: str, reason: str) -> bool:
+        """Flag a long-PDF registry entry whose PageIndex document may be gone."""
+        return self.update(
+            file_hash,
+            {
+                "pageindex_missing": True,
+                "pageindex_missing_reason": reason,
+                "pageindex_uncertain": False,
+            },
+        )
+
+    def mark_pageindex_uncertain(self, file_hash: str, reason: str) -> bool:
+        """Flag a long-PDF registry entry whose PageIndex delete outcome is unknown."""
+        return self.update(
+            file_hash,
+            {
+                "pageindex_uncertain": True,
+                "pageindex_uncertain_reason": reason,
+                "pageindex_missing": False,
+            },
+        )
 
     def remove_by_doc_name(self, doc_name: str) -> bool:
         """Remove the entry whose metadata['doc_name'] matches. Returns True if removed."""
-        for file_hash, meta in list(self._data.items()):
+        new_data = dict(self._data)
+        for file_hash, meta in list(new_data.items()):
             if meta.get("doc_name") == doc_name:
-                del self._data[file_hash]
-                self._persist()
+                del new_data[file_hash]
+                self._persist(new_data)
+                self._data = new_data
                 return True
         return False
 
@@ -61,28 +100,18 @@ class HashRegistry:
         """
         if file_hash not in self._data:
             return False
-        del self._data[file_hash]
-        self._persist()
+        new_data = dict(self._data)
+        del new_data[file_hash]
+        self._persist(new_data)
+        self._data = new_data
         return True
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _persist(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=self._path.parent,
-            prefix=f".{self._path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            json.dump(self._data, fh, indent=2)
-            fh.flush()
-        tmp_path.replace(self._path)
+    def _persist(self, data: dict[str, dict]) -> None:
+        atomic_write_json(self._path, data)
 
     # ------------------------------------------------------------------
     # Static utility

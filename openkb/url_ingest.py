@@ -27,7 +27,7 @@ from urllib.parse import unquote, urlparse
 
 import click
 
-from openkb.locks import maybe_kb_ingest_lock
+from openkb.locks import atomic_write_binary, atomic_write_text, maybe_kb_ingest_lock
 
 _USER_AGENT = "openkb/url-fetcher (+https://github.com/VectifyAI/OpenKB)"
 _TIMEOUT_SECONDS = 30
@@ -155,7 +155,7 @@ def _download_pdf_chunked(response, head_bytes: bytes, target: Path) -> None:
     body to ``target``. Chunked so very large PDFs (50+ MB) don't sit in
     RAM.
     """
-    with open(target, "wb") as fh:
+    with atomic_write_binary(target) as fh:
         if head_bytes:
             fh.write(head_bytes)
         while True:
@@ -207,7 +207,7 @@ def _extract_html(url: str, raw_dir: Path) -> Path | None:
     # would otherwise overwrite each other in raw/ and leave the hash
     # registry pointing at stale bytes.
     target = _unique_path(raw_dir / filename)
-    target.write_text(markdown, encoding="utf-8")
+    atomic_write_text(target, markdown)
     click.echo(
         f"  Extracted: {title!r}\n"
         f"  Saved: raw/{target.name} ({len(markdown) // 1024 or 1} KB clean markdown)"

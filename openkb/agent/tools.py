@@ -10,7 +10,14 @@ import contextlib
 import json as _json
 from pathlib import Path
 
-from openkb.locks import maybe_kb_ingest_lock
+from openkb.locks import atomic_write_text, maybe_kb_ingest_lock, maybe_kb_read_lock
+
+
+def _kb_dir_for_wiki_root(root: Path) -> Path | None:
+    kb_dir = root.parent if root.name == "wiki" else None
+    if kb_dir is not None and (kb_dir / ".openkb").is_dir():
+        return kb_dir
+    return None
 
 
 def list_wiki_files(directory: str, wiki_root: str) -> str:
@@ -28,10 +35,11 @@ def list_wiki_files(directory: str, wiki_root: str) -> str:
     target = (root / directory).resolve()
     if not target.is_relative_to(root):
         return "Access denied: path escapes wiki root."
-    if not target.exists() or not target.is_dir():
-        return "No files found."
-
-    md_files = sorted(p.name for p in target.iterdir() if p.suffix == ".md")
+    kb_dir = _kb_dir_for_wiki_root(root)
+    with maybe_kb_read_lock(kb_dir):
+        if not target.exists() or not target.is_dir():
+            return "No files found."
+        md_files = sorted(p.name for p in target.iterdir() if p.suffix == ".md")
     if not md_files:
         return "No files found."
     return "\n".join(md_files)
@@ -51,9 +59,11 @@ def read_wiki_file(path: str, wiki_root: str) -> str:
     full_path = (root / path).resolve()
     if not full_path.is_relative_to(root):
         return "Access denied: path escapes wiki root."
-    if not full_path.exists():
-        return f"File not found: {path}"
-    return full_path.read_text(encoding="utf-8")
+    kb_dir = _kb_dir_for_wiki_root(root)
+    with maybe_kb_read_lock(kb_dir):
+        if not full_path.exists():
+            return f"File not found: {path}"
+        return full_path.read_text(encoding="utf-8")
 
 
 def parse_pages(pages: str) -> list[int]:
@@ -109,10 +119,11 @@ def get_wiki_page_content(doc_name: str, pages: str, wiki_root: str) -> str:
     target = (root / "sources" / f"{doc_name}.json").resolve()
     if not target.is_relative_to(root):
         return "Access denied: path escapes wiki root."
-    if not target.exists():
-        return f"File not found: sources/{doc_name}.json"
-
-    data = _json.loads(target.read_text(encoding="utf-8"))
+    kb_dir = _kb_dir_for_wiki_root(root)
+    with maybe_kb_read_lock(kb_dir):
+        if not target.exists():
+            return f"File not found: sources/{doc_name}.json"
+        data = _json.loads(target.read_text(encoding="utf-8"))
     requested = set(parse_pages(pages))
     matches = [entry for entry in data if entry.get("page") in requested]
 
@@ -161,11 +172,12 @@ def read_wiki_image(path: str, wiki_root: str) -> dict:
     full_path = (root / path).resolve()
     if not full_path.is_relative_to(root):
         return {"type": "text", "text": "Access denied: path escapes wiki root."}
-    if not full_path.exists():
-        return {"type": "text", "text": f"Image not found: {path}"}
-
-    mime = _MIME_TYPES.get(full_path.suffix.lower(), "image/png")
-    b64 = base64.b64encode(full_path.read_bytes()).decode()
+    kb_dir = _kb_dir_for_wiki_root(root)
+    with maybe_kb_read_lock(kb_dir):
+        if not full_path.exists():
+            return {"type": "text", "text": f"Image not found: {path}"}
+        mime = _MIME_TYPES.get(full_path.suffix.lower(), "image/png")
+        b64 = base64.b64encode(full_path.read_bytes()).decode()
     return {"type": "image", "image_url": f"data:{mime};base64,{b64}"}
 
 
@@ -247,7 +259,7 @@ def write_kb_file(
         )
     with maybe_kb_ingest_lock(root, assume_locked=assume_locked):
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content, encoding="utf-8")
+        atomic_write_text(full_path, content)
     return f"Written: {path}"
 
 
@@ -273,5 +285,5 @@ def write_wiki_file(
     kb_dir = root.parent if root.name == "wiki" else None
     with maybe_kb_ingest_lock(kb_dir, assume_locked=assume_locked):
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content, encoding="utf-8")
+        atomic_write_text(full_path, content)
     return f"Written: {path}"

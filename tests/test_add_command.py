@@ -6,6 +6,7 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 from openkb.cli import SUPPORTED_EXTENSIONS, _find_kb_dir, cli
@@ -320,6 +321,229 @@ class TestAddBatchRunner:
         assert outcome == "failed"
         mock_convert.assert_not_called()
         mock_compile.assert_not_called()
+
+    def test_add_single_file_rolls_back_staged_files_on_compile_failure(self, tmp_path):
+        from openkb.cli import add_single_file
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc = tmp_path / "input" / "bad.md"
+        doc.parent.mkdir()
+        doc.write_text("# Bad")
+
+        async def fail_compile(*_args, **_kwargs):
+            entities = kb_dir / "wiki" / "entities"
+            entities.mkdir(parents=True, exist_ok=True)
+            (entities / "transient.md").write_text(
+                "---\nsources: [summaries/bad.md]\n---\n\n# Transient\n",
+                encoding="utf-8",
+            )
+            raise RuntimeError("LLM 503")
+
+        with patch("openkb.agent.compiler.compile_short_doc", side_effect=fail_compile), \
+             patch("openkb.cli.time.sleep"):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        assert not (kb_dir / "raw" / "bad.md").exists()
+        assert not (kb_dir / "wiki" / "sources" / "bad.md").exists()
+        assert not (kb_dir / "wiki" / "entities" / "transient.md").exists()
+        assert json.loads((kb_dir / ".openkb" / "hashes.json").read_text()) == {}
+
+    def test_add_single_file_rolls_back_partial_staged_install_failure(self, tmp_path):
+        from openkb.cli import _PreparedAdd, _commit_prepared_add
+        from openkb.converter import ConvertResult
+        from openkb.mutation import KbMutationContext
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc = tmp_path / "paper.md"
+        doc.write_text("# Paper")
+
+        def fail_after_partial_install(staging_dir):
+            assert staging_dir is not None
+            (kb_dir / "raw" / "paper.md").write_text("# partial")
+            raise OSError("disk full")
+
+        with KbMutationContext(kb_dir) as tx:
+            staging = tx.staging_dir("paper")
+            (staging / "raw").mkdir(parents=True)
+            (staging / "wiki" / "sources").mkdir(parents=True)
+            (staging / "raw" / "paper.md").write_text("# Paper")
+            (staging / "wiki" / "sources" / "paper.md").write_text("# Paper")
+            prepared = _PreparedAdd(
+                file_path=doc,
+                result=ConvertResult(
+                    raw_path=staging / "raw" / "paper.md",
+                    source_path=staging / "wiki" / "sources" / "paper.md",
+                    file_hash="c" * 64,
+                    staging_dir=staging,
+                ),
+                staging_dir=staging,
+            )
+            with patch.object(tx, "install_staged_tree", side_effect=fail_after_partial_install):
+                outcome = _commit_prepared_add(prepared, tx, "gpt-4o-mini")
+
+        assert outcome == "failed"
+        assert not (kb_dir / "raw" / "paper.md").exists()
+        assert not (kb_dir / "wiki" / "sources" / "paper.md").exists()
+        assert json.loads((kb_dir / ".openkb" / "hashes.json").read_text()) == {}
+
+    def test_long_doc_compile_failure_rolls_back_indexer_outputs(self, tmp_path):
+        from openkb.cli import _PreparedAdd, _commit_prepared_add
+        from openkb.converter import ConvertResult
+        from openkb.indexer import IndexResult
+        from openkb.mutation import KbMutationContext
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc = tmp_path / "paper.pdf"
+        doc.write_bytes(b"%PDF")
+
+        async def fail_compile(*_args, **_kwargs):
+            raise RuntimeError("LLM 503")
+
+        def fake_index(_raw_path, kb, **_kwargs):
+            (kb / "wiki" / "sources" / "paper.json").write_text("[]")
+            (kb / "wiki" / "summaries" / "paper.md").write_text("# Paper")
+            return IndexResult(doc_id="pi-doc-1", description="", tree={})
+
+        with KbMutationContext(kb_dir) as tx:
+            staging = tx.staging_dir("paper")
+            (staging / "raw").mkdir(parents=True)
+            (staging / "raw" / "paper.pdf").write_bytes(b"%PDF")
+            prepared = _PreparedAdd(
+                file_path=doc,
+                result=ConvertResult(
+                    raw_path=staging / "raw" / "paper.pdf",
+                    is_long_doc=True,
+                    file_hash="d" * 64,
+                    staging_dir=staging,
+                ),
+                staging_dir=staging,
+            )
+            with patch("openkb.indexer.index_long_document", side_effect=fake_index), \
+                 patch("openkb.agent.compiler.compile_long_doc", side_effect=fail_compile), \
+                 patch("openkb.cli._cleanup_pageindex", return_value=(True, "deleted")) as cleanup, \
+                 patch("openkb.cli.time.sleep"):
+                outcome = _commit_prepared_add(prepared, tx, "gpt-4o-mini")
+
+        assert outcome == "failed"
+        cleanup.assert_called_once()
+        assert not (kb_dir / "raw" / "paper.pdf").exists()
+        assert not (kb_dir / "wiki" / "sources" / "paper.json").exists()
+        assert not (kb_dir / "wiki" / "summaries" / "paper.md").exists()
+        assert json.loads((kb_dir / ".openkb" / "hashes.json").read_text()) == {}
+
+    def test_long_doc_index_failure_cleans_pageindex_doc_id_from_exception(self, tmp_path):
+        from openkb.cli import _PreparedAdd, _commit_prepared_add
+        from openkb.converter import ConvertResult
+        from openkb.indexer import PageIndexAddError
+        from openkb.mutation import KbMutationContext
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc = tmp_path / "paper.pdf"
+        doc.write_bytes(b"%PDF")
+
+        with KbMutationContext(kb_dir) as tx:
+            staging = tx.staging_dir("paper")
+            (staging / "raw").mkdir(parents=True)
+            (staging / "raw" / "paper.pdf").write_bytes(b"%PDF")
+            prepared = _PreparedAdd(
+                file_path=doc,
+                result=ConvertResult(
+                    raw_path=staging / "raw" / "paper.pdf",
+                    is_long_doc=True,
+                    file_hash="e" * 64,
+                    staging_dir=staging,
+                ),
+                staging_dir=staging,
+            )
+            with patch(
+                "openkb.indexer.index_long_document",
+                side_effect=PageIndexAddError("post-add failed", doc_id="pi-doc-2"),
+            ), patch("openkb.cli._cleanup_pageindex", return_value=(True, "deleted")) as cleanup:
+                outcome = _commit_prepared_add(prepared, tx, "gpt-4o-mini")
+
+        assert outcome == "failed"
+        cleanup.assert_called_once()
+        assert cleanup.call_args.args[3] == "pi-doc-2"
+        assert not (kb_dir / "raw" / "paper.pdf").exists()
+        assert json.loads((kb_dir / ".openkb" / "hashes.json").read_text()) == {}
+
+    def test_registry_failure_rolls_back_before_ingest_log(self, tmp_path):
+        from openkb.cli import _PreparedAdd, _commit_prepared_add
+        from openkb.converter import ConvertResult
+        from openkb.mutation import KbMutationContext
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc = tmp_path / "paper.md"
+        doc.write_text("# Paper")
+
+        async def compile_ok(*_args, **_kwargs):
+            (kb_dir / "wiki" / "summaries" / "paper.md").write_text("# Paper")
+
+        with KbMutationContext(kb_dir) as tx:
+            staging = tx.staging_dir("paper")
+            (staging / "raw").mkdir(parents=True)
+            (staging / "wiki" / "sources").mkdir(parents=True)
+            (staging / "raw" / "paper.md").write_text("# Paper")
+            (staging / "wiki" / "sources" / "paper.md").write_text("# Paper")
+            prepared = _PreparedAdd(
+                file_path=doc,
+                result=ConvertResult(
+                    raw_path=staging / "raw" / "paper.md",
+                    source_path=staging / "wiki" / "sources" / "paper.md",
+                    file_hash="f" * 64,
+                    staging_dir=staging,
+                ),
+                staging_dir=staging,
+            )
+            with patch("openkb.agent.compiler.compile_short_doc", side_effect=compile_ok), \
+                 patch("openkb.state.HashRegistry._persist", side_effect=OSError("disk full")), \
+                 patch("openkb.cli.append_log") as append_log:
+                with pytest.raises(OSError, match="disk full"):
+                    _commit_prepared_add(prepared, tx, "gpt-4o-mini")
+
+        append_log.assert_not_called()
+        assert json.loads((kb_dir / ".openkb" / "hashes.json").read_text()) == {}
+        assert not (kb_dir / "raw" / "paper.md").exists()
+        assert not (kb_dir / "wiki" / "sources" / "paper.md").exists()
+        assert not (kb_dir / "wiki" / "summaries" / "paper.md").exists()
+
+    def test_add_log_failure_is_post_commit_warning(self, tmp_path, capsys):
+        from openkb.cli import _PreparedAdd, _commit_prepared_add
+        from openkb.converter import ConvertResult
+        from openkb.mutation import KbMutationContext
+
+        kb_dir = self._setup_kb(tmp_path)
+        doc = tmp_path / "paper.md"
+        doc.write_text("# Paper")
+
+        async def compile_ok(*_args, **_kwargs):
+            (kb_dir / "wiki" / "summaries" / "paper.md").write_text("# Paper")
+
+        with KbMutationContext(kb_dir) as tx:
+            staging = tx.staging_dir("paper")
+            (staging / "raw").mkdir(parents=True)
+            (staging / "wiki" / "sources").mkdir(parents=True)
+            (staging / "raw" / "paper.md").write_text("# Paper")
+            (staging / "wiki" / "sources" / "paper.md").write_text("# Paper")
+            prepared = _PreparedAdd(
+                file_path=doc,
+                result=ConvertResult(
+                    raw_path=staging / "raw" / "paper.md",
+                    source_path=staging / "wiki" / "sources" / "paper.md",
+                    file_hash="a" * 64,
+                    staging_dir=staging,
+                ),
+                staging_dir=staging,
+            )
+            with patch("openkb.agent.compiler.compile_short_doc", side_effect=compile_ok), \
+                 patch("openkb.cli.append_log", side_effect=OSError("log full")):
+                outcome = _commit_prepared_add(prepared, tx, "gpt-4o-mini")
+
+        assert outcome == "added"
+        assert "[WARN] Log update failed after registry commit" in capsys.readouterr().out
+        assert "a" * 64 in json.loads((kb_dir / ".openkb" / "hashes.json").read_text())
+        assert (kb_dir / "wiki" / "summaries" / "paper.md").exists()
 
 
 class TestWatchCommand:
