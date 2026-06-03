@@ -13,6 +13,7 @@ import logging
 import shutil
 import sys
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Literal
 
@@ -392,6 +393,25 @@ def cli(ctx, verbose, kb_dir_override):
             ctx.obj["kb_dir_override"] = None
 
 
+def _with_kb_lock(*, exclusive: bool):
+    """Wrap a Click command in the appropriate KB lock when a KB exists."""
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(ctx, *args, **kwargs):
+            kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+            if kb_dir is None:
+                return fn(ctx, *args, **kwargs)
+            if exclusive:
+                from openkb.locks import kb_ingest_lock
+                with kb_ingest_lock(kb_dir / ".openkb"):
+                    return fn(ctx, *args, **kwargs)
+            from openkb.locks import kb_read_lock
+            with kb_read_lock(kb_dir / ".openkb"):
+                return fn(ctx, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
 @cli.command()
 @click.argument("path", default=".")
 def use(path):
@@ -574,6 +594,7 @@ def init(model, language):
 @cli.command()
 @click.argument("path")
 @click.pass_context
+@_with_kb_lock(exclusive=True)
 def add(ctx, path):
     """Add a document or directory of documents at PATH to the knowledge base.
 
@@ -784,6 +805,7 @@ def _resolve_doc_identifier(registry, identifier: str) -> list[tuple[str, dict]]
 @click.option("--yes", "-y", is_flag=True, default=False,
               help="Skip the confirmation prompt.")
 @click.pass_context
+@_with_kb_lock(exclusive=True)
 def remove(ctx, identifier, keep_raw, keep_empty, dry_run, yes):
     """Remove a document from the knowledge base.
 
@@ -1065,6 +1087,7 @@ def _refresh_schema(wiki_dir: Path) -> bool:
               help="Overwrite wiki/AGENTS.md with the bundled schema (backs up "
                    "the old one to AGENTS.md.bak) if it differs.")
 @click.pass_context
+@_with_kb_lock(exclusive=True)
 def recompile(ctx, doc_name, all_docs, dry_run, yes, refresh_schema):
     """Re-run the current compile pipeline on already-indexed documents.
 
@@ -1329,6 +1352,7 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
 
 @cli.command()
 @click.pass_context
+@_with_kb_lock(exclusive=True)
 def watch(ctx):
     """Watch the raw/ directory for new documents and process them automatically."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
@@ -1411,6 +1435,7 @@ async def run_lint(kb_dir: Path) -> Path | None:
               help="Rewrite broken [[wikilinks]] in place (fuzzy match) or "
                    "strip to plain text when no match. Runs before the report.")
 @click.pass_context
+@_with_kb_lock(exclusive=True)
 def lint(ctx, fix):
     """Lint the knowledge base for structural and semantic inconsistencies."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
@@ -1494,6 +1519,7 @@ def print_list(kb_dir: Path) -> None:
 
 @cli.command(name="list")
 @click.pass_context
+@_with_kb_lock(exclusive=False)
 def list_cmd(ctx):
     """List all documents in the knowledge base."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
@@ -1564,6 +1590,7 @@ def print_status(kb_dir: Path) -> None:
 
 @cli.command()
 @click.pass_context
+@_with_kb_lock(exclusive=False)
 def status(ctx):
     """Show the current status of the knowledge base.
 
