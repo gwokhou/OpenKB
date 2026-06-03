@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from openkb.locks import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -81,9 +83,10 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
 def save_config(config_path: Path, config: dict) -> None:
     """Persist config dict to YAML, creating parent directories as needed."""
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with config_path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=True)
+    atomic_write_text(
+        config_path,
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=True),
+    )
 
 
 def load_global_config() -> dict[str, Any]:
@@ -96,9 +99,10 @@ def load_global_config() -> dict[str, Any]:
 
 def save_global_config(config: dict[str, Any]) -> None:
     """Save the global config to ~/.config/openkb/global.yaml."""
-    GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with GLOBAL_CONFIG_PATH.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(config, fh, allow_unicode=True, sort_keys=True)
+    atomic_write_text(
+        GLOBAL_CONFIG_PATH,
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=True),
+    )
 
 
 def register_kb(kb_path: Path) -> None:
