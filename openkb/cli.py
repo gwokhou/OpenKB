@@ -52,7 +52,7 @@ from openkb.converter import _registry_path, _sanitize_stem, convert_document
 from openkb.indexer import _write_long_doc_artifacts, prepare_cloud_import
 from openkb.locks import atomic_write_json, atomic_write_text, kb_ingest_lock, kb_read_lock
 from openkb.log import append_log
-from openkb.mutation import MutationSnapshot, publish_staged_tree, snapshot_paths
+from openkb.mutation import publish_staged_tree
 from openkb.schema import AGENTS_MD, INDEX_SEED, PAGE_CONTENT_DIRS
 
 # Suppress warnings after all imports — markitdown overrides filters at import time
@@ -457,29 +457,15 @@ def _add_single_file_locked(
     index_result = None  # populated only on the long-doc branch
 
     final_raw, final_source = _final_artifact_paths(result, kb_dir)
-    try:
-        snapshot = snapshot_paths(
-            kb_dir,
-            _snapshot_add_paths(kb_dir, doc_name, final_raw, final_source),
-            operation="add",
-            details={
-                "file_hash": result.file_hash,
-                "name": file_path.name,
-                "doc_name": doc_name,
-            },
-            hardlink_dirs={
-                kb_dir / "wiki" / "concepts",
-                kb_dir / "wiki" / "entities",
-                kb_dir / ".openkb" / "files",
-            },
-        )
+
+    def commit_body() -> None:
+        nonlocal index_result
         publish_staged_tree(staging_dir, kb_dir)
         if final_raw is not None:
             result.raw_path = final_raw
         if final_source is not None:
             result.source_path = final_source
 
-        # 3/4. Index and compile
         if result.is_long_doc:
             if result.raw_path is None:
                 raise RuntimeError(f"Converted long document has no raw artifact: {file_path.name}")
@@ -542,34 +528,30 @@ def _add_single_file_locked(
                     registry.remove_by_hash(existing_hash)
             registry.add(result.file_hash, meta)
 
-        snapshot.mark_committed()
-    except Exception:
-        if snapshot is None:
-            click.echo(f"  [ERROR] Failed to prepare mutation snapshot for {file_path.name}.")
-            _cleanup_staging(staging_dir)
-            return "failed"
-        rollback_error = snapshot.rollback_best_effort()
-        if rollback_error is None:
-            snapshot.discard_best_effort()
-        else:
-            click.echo(
-                "  [ERROR] Rollback failed; mutation journal retained for recovery: "
-                f"{snapshot.journal_path}"
-            )
-        _cleanup_staging(staging_dir)
-        return "failed"
-    finally:
-        _cleanup_staging(staging_dir)
-
-    try:
+    def append_ingest_log() -> None:
         append_log(kb_dir / "wiki", "ingest", file_path.name)
-    except Exception as exc:
-        logger.warning("Failed to append ingest log for %s: %s", file_path.name, exc)
-    cleanup_error = snapshot.discard_best_effort()
-    if cleanup_error is not None:
-        click.echo(
-            f"  [WARN] {file_path.name} added, but mutation journal cleanup failed: {cleanup_error}"
-        )
+
+    from openkb.add_coordinator import AddMutationPlan, run_add_mutation
+
+    plan = AddMutationPlan(
+        operation="add",
+        details={
+            "file_hash": result.file_hash,
+            "name": file_path.name,
+            "doc_name": doc_name,
+        },
+        touched_paths=_snapshot_add_paths(kb_dir, doc_name, final_raw, final_source),
+        body=commit_body,
+        post_commit_hooks=[append_ingest_log],
+        hardlink_dirs={
+            kb_dir / "wiki" / "concepts",
+            kb_dir / "wiki" / "entities",
+            kb_dir / ".openkb" / "files",
+        },
+        staging_dirs=[staging_dir],
+    )
+    if not run_add_mutation(kb_dir, plan):
+        return "failed"
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
     return "added"
 
@@ -602,8 +584,9 @@ def import_from_pageindex_cloud(
         return "skipped"
 
     click.echo(f"Importing from PageIndex Cloud: {doc_id}")
-    snapshot: MutationSnapshot | None = None
     doc_name = ""
+    from openkb.add_coordinator import AddMutationPlan, DirtyRollbackError, run_add_mutation
+
     try:
         try:
             cloud = prepare_cloud_import(doc_id, kb_dir, path_key)
@@ -613,76 +596,69 @@ def import_from_pageindex_cloud(
             return "failed"
 
         doc_name = cloud.doc_name
-        snapshot = snapshot_paths(
-            kb_dir,
-            _snapshot_add_paths(kb_dir, doc_name, None, None),
+
+        def commit_body() -> None:
+            summary_path = _write_long_doc_artifacts(
+                cloud.tree,
+                cloud.all_pages,
+                doc_name,
+                doc_id,
+                kb_dir,
+                description=cloud.description,
+            )
+            _run_compile_with_retry(
+                lambda: compile_long_doc(
+                    doc_name,
+                    summary_path,
+                    doc_id,
+                    kb_dir,
+                    model,
+                    doc_description=cloud.description,
+                ),
+                label=f"Compiling imported doc (doc_id={doc_id})",
+            )
+
+            # Register the raw-less cloud entry only after successful compilation.
+            registry = HashRegistry(openkb_dir / "hashes.json")
+            meta = {
+                "name": cloud.cloud_name,
+                "doc_name": doc_name,
+                "type": "pageindex_cloud",
+                "origin": "cloud",
+                "path": path_key,
+                "source_path": _registry_path(
+                    kb_dir / "wiki" / "sources" / f"{doc_name}.json", kb_dir
+                ),
+                "doc_id": doc_id,
+            }
+            registry.remove_by_doc_name(doc_name)
+            registry.add(synthetic_hash, meta)
+
+        def append_cloud_log() -> None:
+            append_log(kb_dir / "wiki", "ingest", doc_name)
+
+        plan = AddMutationPlan(
             operation="cloud_import",
             details={"doc_id": doc_id, "doc_name": doc_name},
+            touched_paths=_snapshot_add_paths(kb_dir, doc_name, None, None),
+            body=commit_body,
+            post_commit_hooks=[append_cloud_log],
             hardlink_dirs={
                 kb_dir / "wiki" / "concepts",
                 kb_dir / "wiki" / "entities",
                 kb_dir / ".openkb" / "files",
             },
         )
-        summary_path = _write_long_doc_artifacts(
-            cloud.tree,
-            cloud.all_pages,
-            doc_name,
-            doc_id,
-            kb_dir,
-            description=cloud.description,
-        )
-        _run_compile_with_retry(
-            lambda: compile_long_doc(
-                doc_name,
-                summary_path,
-                doc_id,
-                kb_dir,
-                model,
-                doc_description=cloud.description,
-            ),
-            label=f"Compiling imported doc (doc_id={doc_id})",
-        )
-
-        # Register the raw-less cloud entry only after successful compilation.
-        registry = HashRegistry(openkb_dir / "hashes.json")
-        meta = {
-            "name": cloud.cloud_name,
-            "doc_name": doc_name,
-            "type": "pageindex_cloud",
-            "origin": "cloud",
-            "path": path_key,
-            "source_path": _registry_path(
-                kb_dir / "wiki" / "sources" / f"{doc_name}.json", kb_dir
-            ),
-            "doc_id": doc_id,
-        }
-        registry.remove_by_doc_name(doc_name)
-        registry.add(synthetic_hash, meta)
-        snapshot.mark_committed()
+        with kb_ingest_lock(kb_dir / ".openkb"):
+            if not run_add_mutation(kb_dir, plan):
+                return "failed"
+    except DirtyRollbackError:
+        raise
     except Exception:
-        if snapshot is None:
-            click.echo(f"  [ERROR] Failed to prepare mutation snapshot for cloud import {doc_id}.")
-            return "failed"
-        rollback_error = snapshot.rollback_best_effort()
-        if rollback_error is None:
-            snapshot.discard_best_effort()
-        else:
-            click.echo(
-                "  [ERROR] Rollback failed; mutation journal retained for recovery: "
-                f"{snapshot.journal_path}"
-            )
+        click.echo(f"  [ERROR] Failed to prepare mutation snapshot for cloud import {doc_id}.")
+        logger.debug("Cloud import mutation traceback:", exc_info=True)
         return "failed"
 
-    try:
-        append_log(kb_dir / "wiki", "ingest", doc_name)
-    except Exception as exc:
-        logger.warning("Failed to append ingest log for cloud import %s: %s", doc_id, exc)
-    cleanup_error = snapshot.discard_best_effort()
-    if cleanup_error is not None:
-        click.echo(
-            f"  [WARN] {doc_name} imported, but mutation journal cleanup failed: {cleanup_error}"
-        )
     click.echo(f"  [OK] {doc_name} imported from PageIndex Cloud.")
     return "added"
 
