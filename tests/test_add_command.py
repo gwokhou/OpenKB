@@ -617,6 +617,27 @@ class TestImportFromPageindexCloud:
 
         assert exc_info.value is dirty_error
 
+    def test_cloud_import_failure_message_names_real_cause(self, tmp_path, capsys):
+        """A non-body failure caught at the outer except (here: name resolution)
+        must surface the real error, not be mislabeled as 'Failed to prepare
+        mutation snapshot'. run_add_mutation handles snapshot/body failures
+        itself and returns False, so the broad except only ever catches
+        pre-mutation errors that the old label misdescribed."""
+        from openkb.cli import import_from_pageindex_cloud
+
+        kb_dir = self._setup_kb(tmp_path)
+        cloud = self._cloud_data(doc_name="Cloud-Paper")
+
+        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
+             patch("openkb.cli.resolve_doc_name_from_key",
+                   side_effect=RuntimeError("name resolution blew up")), \
+             patch("openkb.cli._setup_llm_key"):
+            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "failed"
+
+        out = capsys.readouterr().out
+        assert "Failed to prepare mutation snapshot" not in out
+        assert "name resolution blew up" in out
+
     def test_cloud_import_keyboard_interrupt_rolls_back_artifacts(self, tmp_path):
         import pytest
 

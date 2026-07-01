@@ -698,8 +698,11 @@ def import_from_pageindex_cloud(
                 return "failed"
     except DirtyRollbackError:
         raise
-    except Exception:
-        click.echo(f"  [ERROR] Failed to prepare mutation snapshot for cloud import {doc_id}.")
+    except Exception as exc:
+        # run_add_mutation handles snapshot/body failures itself (returns False),
+        # so this except only catches pre-mutation errors — surface the real cause
+        # instead of the old misleading "Failed to prepare mutation snapshot" label.
+        click.echo(f"  [ERROR] Cloud import failed for {doc_id}: {exc}")
         logger.debug("Cloud import mutation traceback:", exc_info=True)
         return "failed"
 
