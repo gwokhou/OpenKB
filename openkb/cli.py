@@ -48,8 +48,17 @@ from openkb.config import (
     resolve_extra_headers, set_extra_headers, resolve_timeout, set_timeout,
     resolve_litellm_settings,
 )
-from openkb.converter import _registry_path, _sanitize_stem, convert_document
-from openkb.indexer import _write_long_doc_artifacts, prepare_cloud_import
+from openkb.converter import (
+    _registry_path,
+    _sanitize_stem,
+    convert_document,
+    resolve_doc_name_from_key,
+)
+from openkb.indexer import (
+    _cloud_display_stem,
+    _write_long_doc_artifacts,
+    prepare_cloud_import,
+)
 from openkb.locks import atomic_write_json, atomic_write_text, kb_ingest_lock, kb_read_lock
 from openkb.log import append_log
 from openkb.mutation import publish_staged_tree
@@ -605,10 +614,11 @@ def import_from_pageindex_cloud(
     path_key = f"pageindex-cloud:{doc_id}"
     synthetic_hash = hashlib.sha256(path_key.encode("utf-8")).hexdigest()
 
-    registry = HashRegistry(openkb_dir / "hashes.json")
-    if registry.is_known(synthetic_hash):
-        click.echo(f"  [SKIP] Already imported from PageIndex Cloud: {doc_id}")
-        return "skipped"
+    with kb_ingest_lock(kb_dir / ".openkb"):
+        registry = HashRegistry(openkb_dir / "hashes.json")
+        if registry.is_known(synthetic_hash):
+            click.echo(f"  [SKIP] Already imported from PageIndex Cloud: {doc_id}")
+            return "skipped"
 
     click.echo(f"Importing from PageIndex Cloud: {doc_id}")
     doc_name = ""
@@ -622,62 +632,68 @@ def import_from_pageindex_cloud(
             logger.debug("Cloud import traceback:", exc_info=True)
             return "failed"
 
-        doc_name = cloud.doc_name
+        with kb_ingest_lock(kb_dir / ".openkb"):
+            registry = HashRegistry(openkb_dir / "hashes.json")
+            if registry.is_known(synthetic_hash):
+                click.echo(f"  [SKIP] Already imported from PageIndex Cloud: {doc_id}")
+                return "skipped"
 
-        def commit_body(_snapshot) -> None:
-            summary_path = _write_long_doc_artifacts(
-                cloud.tree,
-                cloud.all_pages,
-                doc_name,
-                doc_id,
-                kb_dir,
-                description=cloud.description,
-            )
-            _run_compile_with_retry(
-                lambda: compile_long_doc(
+            stem = _cloud_display_stem(cloud.cloud_name, doc_id)
+            doc_name = resolve_doc_name_from_key(stem, path_key, registry)
+
+            def commit_body(_snapshot) -> None:
+                summary_path = _write_long_doc_artifacts(
+                    cloud.tree,
+                    cloud.all_pages,
                     doc_name,
-                    summary_path,
                     doc_id,
                     kb_dir,
-                    model,
-                    doc_description=cloud.description,
-                ),
-                label=f"Compiling imported doc (doc_id={doc_id})",
+                    description=cloud.description,
+                )
+                _run_compile_with_retry(
+                    lambda: compile_long_doc(
+                        doc_name,
+                        summary_path,
+                        doc_id,
+                        kb_dir,
+                        model,
+                        doc_description=cloud.description,
+                    ),
+                    label=f"Compiling imported doc (doc_id={doc_id})",
+                )
+
+                # Register the raw-less cloud entry only after successful compilation.
+                registry = HashRegistry(openkb_dir / "hashes.json")
+                meta = {
+                    "name": cloud.cloud_name,
+                    "doc_name": doc_name,
+                    "type": "pageindex_cloud",
+                    "origin": "cloud",
+                    "path": path_key,
+                    "source_path": _registry_path(
+                        kb_dir / "wiki" / "sources" / f"{doc_name}.json", kb_dir
+                    ),
+                    "doc_id": doc_id,
+                }
+                registry.remove_by_doc_name(doc_name)
+                registry.add(synthetic_hash, meta)
+
+            def append_cloud_log() -> None:
+                append_log(kb_dir / "wiki", "ingest", doc_name)
+
+            plan = AddMutationPlan(
+                operation="cloud_import",
+                details={"doc_id": doc_id, "doc_name": doc_name},
+                touched_paths=_snapshot_add_paths(kb_dir, doc_name, None, None),
+                body=commit_body,
+                post_commit_hooks=[append_cloud_log],
+                # Cloud import reads from PageIndex Cloud and writes no local blob,
+                # so .openkb/files is never touched — nothing to snapshot there.
+                hardlink_dirs={
+                    kb_dir / "wiki" / "concepts",
+                    kb_dir / "wiki" / "entities",
+                },
             )
-
-            # Register the raw-less cloud entry only after successful compilation.
-            registry = HashRegistry(openkb_dir / "hashes.json")
-            meta = {
-                "name": cloud.cloud_name,
-                "doc_name": doc_name,
-                "type": "pageindex_cloud",
-                "origin": "cloud",
-                "path": path_key,
-                "source_path": _registry_path(
-                    kb_dir / "wiki" / "sources" / f"{doc_name}.json", kb_dir
-                ),
-                "doc_id": doc_id,
-            }
-            registry.remove_by_doc_name(doc_name)
-            registry.add(synthetic_hash, meta)
-
-        def append_cloud_log() -> None:
-            append_log(kb_dir / "wiki", "ingest", doc_name)
-
-        plan = AddMutationPlan(
-            operation="cloud_import",
-            details={"doc_id": doc_id, "doc_name": doc_name},
-            touched_paths=_snapshot_add_paths(kb_dir, doc_name, None, None),
-            body=commit_body,
-            post_commit_hooks=[append_cloud_log],
-            # Cloud import reads from PageIndex Cloud and writes no local blob,
-            # so .openkb/files is never touched — nothing to snapshot there.
-            hardlink_dirs={
-                kb_dir / "wiki" / "concepts",
-                kb_dir / "wiki" / "entities",
-            },
-        )
-        with kb_ingest_lock(kb_dir / ".openkb"):
             if not run_add_mutation(kb_dir, plan):
                 return "failed"
     except DirtyRollbackError:

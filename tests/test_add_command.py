@@ -479,6 +479,52 @@ class TestImportFromPageindexCloud:
         assert plan.details == {"doc_id": "cloud-1", "doc_name": "Cloud-Paper"}
         assert kb_dir / ".openkb" / "hashes.json" in plan.touched_paths
 
+    def test_cloud_import_rechecks_doc_name_under_lock_after_prepare_race(self, tmp_path):
+        import hashlib
+        from contextlib import contextmanager
+
+        from openkb.cli import import_from_pageindex_cloud
+        from openkb.locks import kb_ingest_lock as real_kb_ingest_lock
+        from openkb.state import HashRegistry
+
+        kb_dir = self._setup_kb(tmp_path)
+        cloud = self._cloud_data(doc_name="Cloud-Paper")
+        existing_hash = "0" * 64
+        injected = {"done": False}
+
+        @contextmanager
+        def race_before_lock(openkb_dir):
+            if not injected["done"]:
+                registry = HashRegistry(openkb_dir / "hashes.json")
+                registry.add(
+                    existing_hash,
+                    {
+                        "name": "Other Cloud Paper.pdf",
+                        "doc_name": "Cloud-Paper",
+                        "type": "pageindex_cloud",
+                        "origin": "cloud",
+                        "path": "pageindex-cloud:other-cloud",
+                        "source_path": "wiki/sources/Cloud-Paper.json",
+                        "doc_id": "other-cloud",
+                    },
+                )
+                injected["done"] = True
+            with real_kb_ingest_lock(openkb_dir):
+                yield
+
+        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
+             patch("openkb.cli.kb_ingest_lock", side_effect=race_before_lock), \
+             patch("openkb.cli.compile_long_doc", return_value=None), \
+             patch("openkb.cli._setup_llm_key"):
+            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "added"
+
+        registry = HashRegistry(kb_dir / ".openkb" / "hashes.json")
+        synthetic = hashlib.sha256(b"pageindex-cloud:cloud-1").hexdigest()
+        expected_doc_name = f"Cloud-Paper-{synthetic[:8]}"
+        assert registry.get(existing_hash)["doc_name"] == "Cloud-Paper"
+        assert registry.get(synthetic)["doc_name"] == expected_doc_name
+        assert (kb_dir / "wiki" / "sources" / f"{expected_doc_name}.json").exists()
+
     def test_cloud_import_propagates_dirty_rollback(self, tmp_path):
         import pytest
 
