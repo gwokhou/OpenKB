@@ -221,6 +221,31 @@ class TestAddCommand:
             assert "b.txt" in called_names
             assert "ignore.xyz" not in called_names
 
+    def test_add_directory_stops_after_dirty_rollback(self, tmp_path):
+        import pytest
+
+        from openkb.add_coordinator import DirtyRollbackError
+
+        kb_dir = self._setup_kb(tmp_path)
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "a.md").write_text("# A")
+        (docs_dir / "b.md").write_text("# B")
+        dirty_error = DirtyRollbackError(
+            "add",
+            kb_dir / ".openkb" / "journal" / "retained.json",
+        )
+
+        runner = CliRunner()
+        with patch("openkb.cli.add_single_file", side_effect=dirty_error) as mock_add, \
+             patch("openkb.cli._find_kb_dir", return_value=kb_dir):
+            with pytest.raises(DirtyRollbackError) as exc_info:
+                runner.invoke(cli, ["add", str(docs_dir)], catch_exceptions=False)
+
+        assert exc_info.value is dirty_error
+        mock_add.assert_called_once()
+        assert mock_add.call_args.args[0].name == "a.md"
+
     def test_add_unsupported_extension(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
         doc = tmp_path / "file.xyz"
@@ -524,6 +549,52 @@ class TestImportFromPageindexCloud:
         assert registry.get(existing_hash)["doc_name"] == "Cloud-Paper"
         assert registry.get(synthetic)["doc_name"] == expected_doc_name
         assert (kb_dir / "wiki" / "sources" / f"{expected_doc_name}.json").exists()
+
+    def test_cloud_import_skips_if_same_doc_id_registered_after_fetch(self, tmp_path):
+        import hashlib
+        from contextlib import contextmanager
+
+        from openkb.cli import import_from_pageindex_cloud
+        from openkb.locks import kb_ingest_lock as real_kb_ingest_lock
+        from openkb.state import HashRegistry
+
+        kb_dir = self._setup_kb(tmp_path)
+        cloud = self._cloud_data(doc_name="Cloud-Paper")
+        path_key = "pageindex-cloud:cloud-1"
+        synthetic = hashlib.sha256(path_key.encode("utf-8")).hexdigest()
+        lock_calls = {"count": 0}
+
+        @contextmanager
+        def register_same_doc_before_second_lock(openkb_dir):
+            lock_calls["count"] += 1
+            if lock_calls["count"] == 2:
+                HashRegistry(openkb_dir / "hashes.json").add(
+                    synthetic,
+                    {
+                        "name": "Cloud Paper.pdf",
+                        "doc_name": "Cloud-Paper",
+                        "type": "pageindex_cloud",
+                        "origin": "cloud",
+                        "path": path_key,
+                        "source_path": "wiki/sources/Cloud-Paper.json",
+                        "doc_id": "cloud-1",
+                    },
+                )
+            with real_kb_ingest_lock(openkb_dir):
+                yield
+
+        with patch("openkb.cli.prepare_cloud_import", return_value=cloud) as mock_prepare, \
+             patch("openkb.cli.kb_ingest_lock", side_effect=register_same_doc_before_second_lock), \
+             patch("openkb.cli.compile_long_doc") as mock_compile, \
+             patch("openkb.add_coordinator.run_add_mutation") as mock_run, \
+             patch("openkb.cli._setup_llm_key"):
+            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "skipped"
+
+        assert lock_calls["count"] == 2
+        mock_prepare.assert_called_once()
+        mock_compile.assert_not_called()
+        mock_run.assert_not_called()
+        assert HashRegistry(kb_dir / ".openkb" / "hashes.json").is_known(synthetic)
 
     def test_cloud_import_propagates_dirty_rollback(self, tmp_path):
         import pytest
