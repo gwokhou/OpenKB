@@ -9,11 +9,11 @@ from pathlib import Path
 import click
 
 from openkb.locks import kb_ingest_lock_held
-from openkb.mutation import snapshot_paths
+from openkb.mutation import MutationSnapshot, snapshot_paths
 
 logger = logging.getLogger(__name__)
 
-MutationBody = Callable[[], None]
+MutationBody = Callable[[MutationSnapshot], None]
 PostCommitHook = Callable[[], None]
 
 
@@ -100,7 +100,7 @@ def run_add_mutation(kb_dir: Path, plan: AddMutationPlan) -> bool:
             details=plan.details,
             hardlink_dirs=plan.hardlink_dirs,
         )
-        plan.body()
+        plan.body(snapshot)
         snapshot.mark_committed()
     except Exception as exc:
         dirty_journal = _rollback_snapshot(plan, snapshot)

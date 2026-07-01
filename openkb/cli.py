@@ -362,13 +362,18 @@ def _snapshot_add_paths(
     final_raw: Path | None,
     final_source: Path | None,
 ) -> list[Path]:
+    # NOTE: .openkb/files (the PageIndex blob store) is intentionally NOT
+    # snapshotted here. It is append-only by {doc_id}, and the doc_id is only
+    # assigned during indexing (after this snapshot). Eagerly snapshotting the
+    # whole tree cost one os.link per existing blob on every add; instead the
+    # long-doc add path registers just the new blob via snapshot.track_new()
+    # once indexing has run.
     paths = [
         kb_dir / ".openkb" / "hashes.json",
         kb_dir / ".openkb" / "pageindex.db",
         kb_dir / ".openkb" / "pageindex.db-wal",
         kb_dir / ".openkb" / "pageindex.db-shm",
         kb_dir / ".openkb" / "pageindex.db-journal",
-        kb_dir / ".openkb" / "files",
         kb_dir / "wiki" / "summaries" / f"{doc_name}.md",
         kb_dir / "wiki" / "sources" / f"{doc_name}.json",
         kb_dir / "wiki" / "sources" / "images" / doc_name,
@@ -436,7 +441,6 @@ def _add_single_file_locked(
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
     staging_dir = _staging_dir_for(kb_dir, file_path) if stage else None
-    snapshot: MutationSnapshot | None = None
 
     # 2. Convert document into staging when possible.
     click.echo(f"Adding: {file_path.name}")
@@ -458,7 +462,7 @@ def _add_single_file_locked(
 
     final_raw, final_source = _final_artifact_paths(result, kb_dir)
 
-    def commit_body() -> None:
+    def commit_body(snapshot) -> None:
         nonlocal index_result
         publish_staged_tree(staging_dir, kb_dir)
         if final_raw is not None:
@@ -470,6 +474,16 @@ def _add_single_file_locked(
             if result.raw_path is None:
                 raise RuntimeError(f"Converted long document has no raw artifact: {file_path.name}")
             click.echo("  Long document detected — indexing with PageIndex...")
+            # PageIndex content-dedups: if the same content is already indexed
+            # (e.g. hashes.json and pageindex.db diverged after a remove whose
+            # PageIndex cleanup failed), col.add() returns the EXISTING doc_id
+            # and writes no new blob. Capture the blob set *before* indexing so
+            # we register only blobs THIS add actually created — otherwise
+            # rollback would delete a prior document's blob.
+            files_root = kb_dir / ".openkb" / "files"
+            blobs_before = (
+                set(files_root.glob("*/*")) if files_root.exists() else set()
+            )
             try:
                 from openkb.indexer import index_long_document
 
@@ -480,6 +494,20 @@ def _add_single_file_locked(
                 click.echo(f"  [ERROR] Indexing failed: {exc}")
                 logger.debug("Indexing traceback:", exc_info=True)
                 raise
+
+            # Register only the newly-created blob artifacts for this doc (the
+            # {doc_id} file + its images dir) — the append-only store means the
+            # name isn't known until now — so rollback + crash recovery remove
+            # exactly this add's blob, never a pre-existing one, instead of
+            # snapshotting the whole store up front. The doc_id guard + the
+            # blobs_before diff keep a dedup hit (or an unexpected empty doc_id)
+            # from registering — and later deleting — existing blobs.
+            if index_result.doc_id and files_root.exists():
+                snapshot.track_new([
+                    p
+                    for p in files_root.glob(f"*/{index_result.doc_id}*")
+                    if p not in blobs_before
+                ])
 
             summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
             _run_compile_with_retry(
@@ -546,7 +574,6 @@ def _add_single_file_locked(
         hardlink_dirs={
             kb_dir / "wiki" / "concepts",
             kb_dir / "wiki" / "entities",
-            kb_dir / ".openkb" / "files",
         },
         staging_dirs=[staging_dir],
     )
@@ -597,7 +624,7 @@ def import_from_pageindex_cloud(
 
         doc_name = cloud.doc_name
 
-        def commit_body() -> None:
+        def commit_body(_snapshot) -> None:
             summary_path = _write_long_doc_artifacts(
                 cloud.tree,
                 cloud.all_pages,
@@ -643,10 +670,11 @@ def import_from_pageindex_cloud(
             touched_paths=_snapshot_add_paths(kb_dir, doc_name, None, None),
             body=commit_body,
             post_commit_hooks=[append_cloud_log],
+            # Cloud import reads from PageIndex Cloud and writes no local blob,
+            # so .openkb/files is never touched — nothing to snapshot there.
             hardlink_dirs={
                 kb_dir / "wiki" / "concepts",
                 kb_dir / "wiki" / "entities",
-                kb_dir / ".openkb" / "files",
             },
         )
         with kb_ingest_lock(kb_dir / ".openkb"):

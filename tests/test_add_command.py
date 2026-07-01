@@ -119,6 +119,89 @@ class TestAddCommand:
         assert plan.details["doc_name"] == "coordinated"
         assert kb_dir / ".openkb" / "hashes.json" in plan.touched_paths
 
+    def _long_doc_conv(self, kb_dir, name, file_hash):
+        from openkb.converter import ConvertResult
+
+        return ConvertResult(
+            raw_path=kb_dir / "raw" / f"{name}.pdf",
+            source_path=None,
+            is_long_doc=True,
+            file_hash=file_hash,
+            doc_name=name,
+        )
+
+    def test_long_doc_rollback_removes_only_the_new_blob(self, tmp_path):
+        """A failed long-doc add must roll back the blob IT created under
+        .openkb/files, while a pre-existing blob (another document) survives —
+        the targeted track_new must not touch blobs this add didn't create."""
+        from openkb.cli import add_single_file
+        from openkb.indexer import IndexResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        files = kb_dir / ".openkb" / "files" / "default"
+        files.mkdir(parents=True)
+        other = files / "other-doc.pdf"
+        other.write_bytes(b"another-doc-keep-me")
+
+        new_id = "11111111-1111-1111-1111-111111111111"
+
+        def fake_index(raw_path, kb_dir_arg, doc_name=None):
+            (files / f"{new_id}.pdf").write_bytes(b"new-blob")
+            (files / new_id / "images").mkdir(parents=True)
+            (files / new_id / "images" / "p1.png").write_bytes(b"img")
+            return IndexResult(doc_id=new_id, description="", tree={"structure": []})
+
+        doc = tmp_path / "paper.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+        conv = self._long_doc_conv(kb_dir, "paper", "cafebabe00" * 8)
+
+        with patch("openkb.cli.convert_document", return_value=conv), \
+             patch("openkb.indexer.index_long_document", side_effect=fake_index), \
+             patch("openkb.agent.compiler.compile_long_doc",
+                   side_effect=RuntimeError("boom")), \
+             patch("openkb.cli.time.sleep"), \
+             patch("openkb.cli._setup_llm_key"):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        assert not (files / f"{new_id}.pdf").exists()   # new blob rolled back
+        assert not (files / new_id).exists()            # new images subtree rolled back
+        assert other.read_bytes() == b"another-doc-keep-me"  # pre-existing survives
+
+    def test_long_doc_dedup_hit_does_not_delete_existing_blob(self, tmp_path):
+        """PageIndex content-dedup can return an EXISTING doc_id and write no new
+        blob (diverged hashes.json/pageindex.db). A failed add must NOT delete
+        that pre-existing blob on rollback (regression: track_new globbing the
+        doc_id would otherwise register and delete it)."""
+        from openkb.cli import add_single_file
+        from openkb.indexer import IndexResult
+
+        kb_dir = self._setup_kb(tmp_path)
+        files = kb_dir / ".openkb" / "files" / "default"
+        files.mkdir(parents=True)
+        existing_id = "22222222-2222-2222-2222-222222222222"
+        existing_blob = files / f"{existing_id}.pdf"
+        existing_blob.write_bytes(b"pre-existing-do-not-delete")
+
+        def fake_index_dedup(raw_path, kb_dir_arg, doc_name=None):
+            # Dedup hit: return the existing doc_id, create NO new blob.
+            return IndexResult(doc_id=existing_id, description="", tree={"structure": []})
+
+        doc = tmp_path / "dup.pdf"
+        doc.write_bytes(b"%PDF-1.4 dup")
+        conv = self._long_doc_conv(kb_dir, "dup", "feedface00" * 8)
+
+        with patch("openkb.cli.convert_document", return_value=conv), \
+             patch("openkb.indexer.index_long_document", side_effect=fake_index_dedup), \
+             patch("openkb.agent.compiler.compile_long_doc",
+                   side_effect=RuntimeError("boom")), \
+             patch("openkb.cli.time.sleep"), \
+             patch("openkb.cli._setup_llm_key"):
+            outcome = add_single_file(doc, kb_dir)
+
+        assert outcome == "failed"
+        assert existing_blob.read_bytes() == b"pre-existing-do-not-delete"
+
     def test_add_directory_calls_helper_for_each_file(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
         docs_dir = tmp_path / "docs"
@@ -487,7 +570,7 @@ class TestAddMutationCoordinator:
         official = kb_dir / "wiki" / "sources" / "doc.md"
         post_commit_calls = []
 
-        def body():
+        def body(_snapshot):
             official.parent.mkdir(parents=True, exist_ok=True)
             official.write_text("# changed\n", encoding="utf-8")
             raise RuntimeError("before commit")
@@ -512,7 +595,7 @@ class TestAddMutationCoordinator:
         kb_dir = self._setup_kb(tmp_path)
         official = kb_dir / "wiki" / "sources" / "doc.md"
 
-        def body():
+        def body(_snapshot):
             official.parent.mkdir(parents=True, exist_ok=True)
             official.write_text("# changed\n", encoding="utf-8")
             raise RuntimeError("boom")
@@ -537,7 +620,7 @@ class TestAddMutationCoordinator:
         kb_dir = self._setup_kb(tmp_path)
         official = kb_dir / "wiki" / "sources" / "doc.md"
 
-        def body():
+        def body(_snapshot):
             official.parent.mkdir(parents=True, exist_ok=True)
             official.write_text("# committed\n", encoding="utf-8")
 
@@ -567,7 +650,7 @@ class TestAddMutationCoordinator:
         official = kb_dir / "wiki" / "sources" / "doc.md"
         post_commit_calls = []
 
-        def body():
+        def body(_snapshot):
             official.parent.mkdir(parents=True, exist_ok=True)
             official.write_text("# interrupted\n", encoding="utf-8")
             raise KeyboardInterrupt()
@@ -599,7 +682,7 @@ class TestAddMutationCoordinator:
             operation="add",
             details={"doc_name": "doc"},
             touched_paths=[kb_dir / "wiki" / "sources" / "doc.md"],
-            body=lambda: None,
+            body=lambda _snapshot: None,
         )
 
         with pytest.raises(RuntimeError, match="requires the caller to hold kb_ingest_lock"):
@@ -617,7 +700,7 @@ class TestAddMutationCoordinator:
         official.parent.mkdir(parents=True, exist_ok=True)
         official.write_text("# before\n", encoding="utf-8")
 
-        def body():
+        def body(_snapshot):
             official.write_text("# after\n", encoding="utf-8")
             raise RuntimeError("body fails after partial apply")
 
