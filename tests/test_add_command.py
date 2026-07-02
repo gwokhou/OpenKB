@@ -114,11 +114,13 @@ class TestAddCommand:
             doc_name="coordinated",
         )
 
-        with patch("openkb.cli.convert_document", return_value=result), \
-             patch("openkb.cli.publish_staged_tree"), \
-             patch("openkb.cli.asyncio.run"), \
-             patch("openkb.cli._setup_llm_key"), \
-             patch("openkb.add_coordinator.run_add_mutation", return_value=True) as mock_run:
+        with (
+            patch("openkb.cli.convert_document", return_value=result),
+            patch("openkb.cli.publish_staged_tree"),
+            patch("openkb.cli.asyncio.run"),
+            patch("openkb.cli._setup_llm_key"),
+            patch("openkb.add_coordinator.run_add_mutation", return_value=True) as mock_run,
+        ):
             assert add_single_file(doc, kb_dir) == "added"
 
         plan = mock_run.call_args.args[1]
@@ -248,8 +250,10 @@ class TestAddCommand:
         )
 
         runner = CliRunner()
-        with patch("openkb.cli.add_single_file", side_effect=dirty_error) as mock_add, \
-             patch("openkb.cli._find_kb_dir", return_value=kb_dir):
+        with (
+            patch("openkb.cli.add_single_file", side_effect=dirty_error) as mock_add,
+            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
+        ):
             with pytest.raises(DirtyRollbackError) as exc_info:
                 runner.invoke(cli, ["add", str(docs_dir)], catch_exceptions=False)
 
@@ -524,9 +528,11 @@ class TestImportFromPageindexCloud:
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data(doc_name="Cloud-Paper")
 
-        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
-             patch("openkb.add_coordinator.run_add_mutation", return_value=True) as mock_run, \
-             patch("openkb.cli._setup_llm_key"):
+        with (
+            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
+            patch("openkb.add_coordinator.run_add_mutation", return_value=True) as mock_run,
+            patch("openkb.cli._setup_llm_key"),
+        ):
             assert import_from_pageindex_cloud("cloud-1", kb_dir) == "added"
 
         plan = mock_run.call_args.args[1]
@@ -567,10 +573,12 @@ class TestImportFromPageindexCloud:
             with real_kb_ingest_lock(openkb_dir):
                 yield
 
-        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
-             patch("openkb.cli.kb_ingest_lock", side_effect=race_before_lock), \
-             patch("openkb.cli.compile_long_doc", return_value=None), \
-             patch("openkb.cli._setup_llm_key"):
+        with (
+            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
+            patch("openkb.cli.kb_ingest_lock", side_effect=race_before_lock),
+            patch("openkb.cli.compile_long_doc", return_value=None),
+            patch("openkb.cli._setup_llm_key"),
+        ):
             assert import_from_pageindex_cloud("cloud-1", kb_dir) == "added"
 
         registry = HashRegistry(kb_dir / ".openkb" / "hashes.json")
@@ -613,11 +621,13 @@ class TestImportFromPageindexCloud:
             with real_kb_ingest_lock(openkb_dir):
                 yield
 
-        with patch("openkb.cli.prepare_cloud_import", return_value=cloud) as mock_prepare, \
-             patch("openkb.cli.kb_ingest_lock", side_effect=register_same_doc_before_second_lock), \
-             patch("openkb.cli.compile_long_doc") as mock_compile, \
-             patch("openkb.add_coordinator.run_add_mutation") as mock_run, \
-             patch("openkb.cli._setup_llm_key"):
+        with (
+            patch("openkb.cli.prepare_cloud_import", return_value=cloud) as mock_prepare,
+            patch("openkb.cli.kb_ingest_lock", side_effect=register_same_doc_before_second_lock),
+            patch("openkb.cli.compile_long_doc") as mock_compile,
+            patch("openkb.add_coordinator.run_add_mutation") as mock_run,
+            patch("openkb.cli._setup_llm_key"),
+        ):
             assert import_from_pageindex_cloud("cloud-1", kb_dir) == "skipped"
 
         assert lock_calls["count"] == 2
@@ -639,9 +649,11 @@ class TestImportFromPageindexCloud:
             kb_dir / ".openkb" / "journal" / "retained.json",
         )
 
-        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
-             patch("openkb.add_coordinator.run_add_mutation", side_effect=dirty_error), \
-             patch("openkb.cli._setup_llm_key"):
+        with (
+            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
+            patch("openkb.add_coordinator.run_add_mutation", side_effect=dirty_error),
+            patch("openkb.cli._setup_llm_key"),
+        ):
             with pytest.raises(DirtyRollbackError) as exc_info:
                 import_from_pageindex_cloud("cloud-1", kb_dir)
 
@@ -658,10 +670,14 @@ class TestImportFromPageindexCloud:
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data(doc_name="Cloud-Paper")
 
-        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
-             patch("openkb.cli.resolve_doc_name_from_key",
-                   side_effect=RuntimeError("name resolution blew up")), \
-             patch("openkb.cli._setup_llm_key"):
+        with (
+            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
+            patch(
+                "openkb.cli.resolve_doc_name_from_key",
+                side_effect=RuntimeError("name resolution blew up"),
+            ),
+            patch("openkb.cli._setup_llm_key"),
+        ):
             assert import_from_pageindex_cloud("cloud-1", kb_dir) == "failed"
 
         out = capsys.readouterr().out
@@ -678,9 +694,11 @@ class TestImportFromPageindexCloud:
         doc_name = "Cloud-Paper"
         cloud = self._cloud_data(doc_name=doc_name)
 
-        with patch("openkb.cli.prepare_cloud_import", return_value=cloud), \
-             patch("openkb.cli.compile_long_doc", side_effect=KeyboardInterrupt()), \
-             patch("openkb.cli._setup_llm_key"):
+        with (
+            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
+            patch("openkb.cli.compile_long_doc", side_effect=KeyboardInterrupt()),
+            patch("openkb.cli._setup_llm_key"),
+        ):
             with pytest.raises(KeyboardInterrupt):
                 import_from_pageindex_cloud("cloud-1", kb_dir)
 

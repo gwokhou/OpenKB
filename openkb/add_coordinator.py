@@ -88,9 +88,7 @@ def _failure_target(details: dict) -> str:
 
 def run_add_mutation(kb_dir: Path, plan: AddMutationPlan) -> bool:
     if not kb_ingest_lock_held(kb_dir / ".openkb"):
-        raise RuntimeError(
-            "run_add_mutation requires the caller to hold kb_ingest_lock"
-        )
+        raise RuntimeError("run_add_mutation requires the caller to hold kb_ingest_lock")
     snapshot = None
     try:
         snapshot = snapshot_paths(
@@ -109,9 +107,7 @@ def run_add_mutation(kb_dir: Path, plan: AddMutationPlan) -> bool:
             # than committing more docs on top of dirty state that the next
             # recovery would roll back over.
             raise DirtyRollbackError(plan.operation, dirty_journal)
-        click.echo(
-            f"  [ERROR] {plan.operation} failed{_failure_target(plan.details)}: {exc}"
-        )
+        click.echo(f"  [ERROR] {plan.operation} failed{_failure_target(plan.details)}: {exc}")
         logger.debug("%s mutation failed:", plan.operation, exc_info=True)
         return False
     except BaseException:
