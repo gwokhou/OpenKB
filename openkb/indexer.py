@@ -243,8 +243,12 @@ def index_long_document(pdf_path: Path, kb_dir: Path, doc_name: str | None = Non
 
         if not all_pages:
             if pageindex_api_key:
-                logger.warning("Cloud returned no pages for %s; falling back to local pymupdf", pdf_path.name)
-            all_pages = _normalize_page_content(_convert_pdf_to_pages(pdf_path, source_name, images_dir))
+                logger.warning(
+                    "Cloud returned no pages for %s; falling back to local pymupdf", pdf_path.name
+                )
+            all_pages = _normalize_page_content(
+                _convert_pdf_to_pages(pdf_path, source_name, images_dir)
+            )
 
         if not all_pages:
             raise RuntimeError(f"No page content extracted for {pdf_path.name}")

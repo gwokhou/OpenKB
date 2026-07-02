@@ -884,7 +884,9 @@ class TestAddMutationCoordinator:
         # Force rollback to fail: rollback_best_effort returns the error instead
         # of None, so the active journal is retained for next-run recovery.
         with kb_ingest_lock(kb_dir / ".openkb"):
-            with patch.object(MutationSnapshot, "rollback_best_effort", return_value=OSError("disk full")):
+            with patch.object(
+                MutationSnapshot, "rollback_best_effort", return_value=OSError("disk full")
+            ):
                 with pytest.raises(DirtyRollbackError) as exc_info:
                     run_add_mutation(kb_dir, plan)
 
