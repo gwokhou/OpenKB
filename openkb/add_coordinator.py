@@ -48,7 +48,6 @@ class AddMutationPlan:
     post_commit_hooks: Sequence[PostCommitHook] = field(default_factory=tuple)
     hardlink_dirs: set[Path] = field(default_factory=set)
     staging_dirs: Sequence[Path | None] = field(default_factory=tuple)
-    rollback_error_message: str = "Rollback failed; mutation journal retained for recovery"
 
 
 def _cleanup_staging_dirs(staging_dirs: Sequence[Path | None]) -> None:
@@ -73,7 +72,10 @@ def _rollback_snapshot(plan: AddMutationPlan, snapshot) -> Path | None:
     if rollback_error is None:
         snapshot.discard_best_effort()
     else:
-        click.echo(f"  [ERROR] {plan.rollback_error_message}: {snapshot.journal_path}")
+        click.echo(
+            "  [ERROR] Rollback failed; mutation journal retained for recovery: "
+            f"{snapshot.journal_path}"
+        )
     _cleanup_staging_dirs(plan.staging_dirs)
     return snapshot.journal_path if rollback_error is not None else None
 
