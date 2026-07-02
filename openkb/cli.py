@@ -60,6 +60,7 @@ from openkb.config import (
     set_timeout,
     resolve_litellm_settings,
 )
+from openkb.add_coordinator import _cleanup_staging_dirs
 from openkb.converter import (
     _registry_path,
     _sanitize_stem,
@@ -384,11 +385,6 @@ def _staging_dir_for(kb_dir: Path, file_path: Path) -> Path:
     return path
 
 
-def _cleanup_staging(path: Path | None) -> None:
-    if path is not None:
-        shutil.rmtree(path, ignore_errors=True)
-
-
 def _final_artifact_paths(result, kb_dir: Path) -> tuple[Path | None, Path | None]:
     final_raw = None
     final_source = None
@@ -492,12 +488,12 @@ def _add_single_file_locked(
     except Exception as exc:
         click.echo(f"  [ERROR] Conversion failed: {exc}")
         logger.debug("Conversion traceback:", exc_info=True)
-        _cleanup_staging(staging_dir)
+        _cleanup_staging_dirs([staging_dir])
         return "failed"
 
     if result.skipped:
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
-        _cleanup_staging(staging_dir)
+        _cleanup_staging_dirs([staging_dir])
         return "skipped"
 
     doc_name = result.doc_name or file_path.stem
