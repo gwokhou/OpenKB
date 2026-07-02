@@ -1,22 +1,22 @@
 """Tests for openkb.images — base64 extraction and relative image copy."""
+
 from __future__ import annotations
 
 import base64
 
-
 from openkb.images import copy_relative_images, extract_base64_images
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
 FAKE_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8  # minimal fake PNG bytes
-FAKE_JPG = b"\xff\xd8\xff" + b"\x00" * 8        # minimal fake JPEG bytes
+FAKE_JPG = b"\xff\xd8\xff" + b"\x00" * 8  # minimal fake JPEG bytes
 
 
 # ---------------------------------------------------------------------------
@@ -53,10 +53,7 @@ class TestExtractBase64Images:
         images_dir.mkdir(parents=True)
         b64_png = _make_b64(FAKE_PNG)
         b64_jpg = _make_b64(FAKE_JPG)
-        md = (
-            f"![fig1](data:image/png;base64,{b64_png})\n"
-            f"![fig2](data:image/jpeg;base64,{b64_jpg})"
-        )
+        md = f"![fig1](data:image/png;base64,{b64_png})\n![fig2](data:image/jpeg;base64,{b64_jpg})"
         result = extract_base64_images(md, "doc", images_dir)
 
         assert "![fig1](sources/images/doc/img_001.png)" in result
@@ -70,6 +67,7 @@ class TestExtractBase64Images:
         bad = "NOT_VALID_BASE64!!!"
         md = f"![alt](data:image/png;base64,{bad})"
         import logging
+
         with caplog.at_level(logging.WARNING, logger="openkb.images"):
             result = extract_base64_images(md, "doc", images_dir)
         assert result == md  # unchanged
@@ -82,11 +80,9 @@ class TestExtractBase64Images:
         images_dir.mkdir(parents=True)
         b64 = _make_b64(FAKE_PNG)
         bad = "BADBAD!!!"
-        md = (
-            f"![good](data:image/png;base64,{b64})\n"
-            f"![bad](data:image/png;base64,{bad})"
-        )
+        md = f"![good](data:image/png;base64,{b64})\n![bad](data:image/png;base64,{bad})"
         import logging
+
         with caplog.at_level(logging.WARNING, logger="openkb.images"):
             result = extract_base64_images(md, "doc", images_dir)
         assert "![good](sources/images/doc/img_001.png)" in result
@@ -122,6 +118,7 @@ class TestCopyRelativeImages:
 
         md = "![missing](missing.png)"
         import logging
+
         with caplog.at_level(logging.WARNING, logger="openkb.images"):
             result = copy_relative_images(md, source_dir, "doc", images_dir)
         assert result == md  # unchanged
@@ -164,3 +161,38 @@ class TestCopyRelativeImages:
         assert "![b](sources/images/doc/b.jpg)" in result
         assert (images_dir / "a.png").exists()
         assert (images_dir / "b.jpg").exists()
+
+    def test_same_basename_different_dirs_no_overwrite(self, tmp_path):
+        # Two distinct images sharing a basename must not overwrite each other
+        # (which would lose one image and point both links at the survivor).
+        source_dir = tmp_path / "source"
+        (source_dir / "a").mkdir(parents=True)
+        (source_dir / "b").mkdir(parents=True)
+        (source_dir / "a" / "logo.png").write_bytes(FAKE_PNG)
+        (source_dir / "b" / "logo.png").write_bytes(FAKE_JPG)
+
+        images_dir = tmp_path / "images" / "doc"
+        images_dir.mkdir(parents=True)
+
+        md = "![a](a/logo.png)\n![b](b/logo.png)"
+        result = copy_relative_images(md, source_dir, "doc", images_dir)
+
+        saved = sorted(p.name for p in images_dir.iterdir())
+        assert len(saved) == 2  # both copied, neither overwritten
+        assert {(images_dir / n).read_bytes() for n in saved} == {FAKE_PNG, FAKE_JPG}
+        links = sorted(line.split("](")[1].rstrip(")") for line in result.strip().splitlines())
+        assert links[0] != links[1]  # links point at different files
+
+    def test_same_image_referenced_twice_is_copied_once(self, tmp_path):
+        # Identical source referenced twice: copy once, both links agree.
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        (source_dir / "logo.png").write_bytes(FAKE_PNG)
+        images_dir = tmp_path / "images" / "doc"
+        images_dir.mkdir(parents=True)
+
+        md = "![x](logo.png)\n![y](logo.png)"
+        result = copy_relative_images(md, source_dir, "doc", images_dir)
+
+        assert [p.name for p in images_dir.iterdir()] == ["logo.png"]
+        assert result.count("sources/images/doc/logo.png") == 2
